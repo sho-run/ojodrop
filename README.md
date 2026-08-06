@@ -42,6 +42,27 @@ interpret presets is a little fuzzy, so I made some middle-of-the-road decisions
 I may iterate more to get the fidelity rate up, but there will be diminishing returns unless
 I found a couple of slam dunk levers to move the needle.
 
+## Update — August 6, 2026 (8/6/26)
+
+OjoDrop just received a substantial round of MilkDrop compatibility, bug-fix,
+and visual-fidelity improvements. The goal is recognizable behavior relative to
+Butterchurn—not byte-identical frames and not one-off fixes for individual
+presets.
+
+- Fixed feedback texture-coordinate conventions in both the warp and composite
+  paths. Recursive presets now develop in the expected direction instead of
+  slowly diverging because WebGL and WGPU use opposite texture origins.
+- Added Butterchurn-style composite-mesh behavior, including its 32×24 mesh and
+  interpolated per-vertex color field.
+- Fixed several EEL equation-analysis and preset-preprocessing edge cases used
+  by more demanding MilkDrop presets.
+- Rechecked a balanced selection of `$$$ Royal` and three-digit presets at
+  1920×1080 using a real MP3 for audio reactivity. All 50 selected presets
+  converted and rendered successfully, with substantially closer feedback,
+  geometry, motion, and color behavior overall.
+- Kept the renderer general-purpose: these changes do not add preset-specific
+  brightness, palette, or gain hacks.
+
 ## Is it faster than WebGL2? Was it worth it to move to WGPU?
 
 Listen. I just make the stuff. I was curious on Reddit 3 days ago and boom, this popped out of Claude.
