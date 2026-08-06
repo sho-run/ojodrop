@@ -20,6 +20,8 @@ use crate::preprocess::{
 
 const GRID_W: u32 = 48;
 const GRID_H: u32 = 36;
+const COMP_GRID_W: u32 = 32;
+const COMP_GRID_H: u32 = 24;
 const GPU_TIME_WRAP_SECONDS: f64 = 65_536.0;
 const GPU_FRAME_WRAP: u64 = 1 << 24;
 
@@ -99,6 +101,17 @@ pub struct MilkdropGeometryDiagnostics {
     pub post_warp_rgb: Option<MilkdropRgbSummary>,
     pub post_overlays_rgb: Option<MilkdropRgbSummary>,
     pub post_comp_rgb: Option<MilkdropRgbSummary>,
+}
+
+/// Opt-in, tightly packed RGBA8 snapshots of the three fidelity checkpoints.
+/// These are exposed only while geometry diagnostics are enabled.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MilkdropStageImages {
+    pub width: u32,
+    pub height: u32,
+    pub post_warp_rgba: Vec<u8>,
+    pub post_overlays_rgba: Vec<u8>,
+    pub post_comp_rgba: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -220,6 +233,16 @@ struct WarpVert {
     decay: [f32; 4], // per-vertex decay rgb (a unused = 1.0)
 }
 const _: () = assert!(std::mem::size_of::<WarpVert>() == 32);
+
+/// Butterchurn's composition pass is a 32x24 mesh. Its color is the smoothly
+/// interpolated `hue_shader` field exposed to authored comp shaders.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct CompVert {
+    pos: [f32; 2],
+    color: [f32; 4],
+}
+const _: () = assert!(std::mem::size_of::<CompVert>() == 24);
 
 // Per-frame warp base values (from MilkShaders), overridable by the per-frame EEL.
 #[derive(Copy, Clone)]
@@ -531,6 +554,7 @@ const CUSTOM_WAVE_LOD_SAMPLES: usize = 256;
 #[derive(Default)]
 struct RendererScratch {
     warp_verts: Vec<WarpVert>,
+    comp_verts: Vec<CompVert>,
     motion_verts: Vec<MVVert>,
     darken_verts: Vec<DarkenVert>,
     shape_fill_verts: Vec<ShapeVert>,
@@ -887,6 +911,34 @@ impl GeometryStageReadback {
             ),
         ]
     }
+
+    fn read_images(&self, device: &wgpu::Device) -> Option<MilkdropStageImages> {
+        Some(MilkdropStageImages {
+            width: self.width,
+            height: self.height,
+            post_warp_rgba: read_stage_rgba8(
+                device,
+                &self.post_warp,
+                self.width,
+                self.height,
+                self.padded_bytes_per_row,
+            )?,
+            post_overlays_rgba: read_stage_rgba8(
+                device,
+                &self.post_overlays,
+                self.width,
+                self.height,
+                self.padded_bytes_per_row,
+            )?,
+            post_comp_rgba: read_stage_rgba8(
+                device,
+                &self.post_comp,
+                self.width,
+                self.height,
+                self.padded_bytes_per_row,
+            )?,
+        })
+    }
 }
 
 impl GeometryDiagnosticCollector {
@@ -1034,6 +1086,38 @@ fn read_stage_rgb_summary(
     summary
 }
 
+fn read_stage_rgba8(
+    device: &wgpu::Device,
+    buffer: &wgpu::Buffer,
+    width: u32,
+    height: u32,
+    padded_bytes_per_row: u32,
+) -> Option<Vec<u8>> {
+    let active_bytes_per_row = usize::try_from(width).ok()?.checked_mul(4)?;
+    let padded_bytes_per_row = usize::try_from(padded_bytes_per_row).ok()?;
+    if active_bytes_per_row > padded_bytes_per_row {
+        return None;
+    }
+    let slice = buffer.slice(..);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = sender.send(result);
+    });
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    receiver.recv().ok()?.ok()?;
+    let mapped = slice.get_mapped_range();
+    let mut rgba = Vec::with_capacity(active_bytes_per_row.checked_mul(height as usize)?);
+    for row in mapped
+        .chunks_exact(padded_bytes_per_row)
+        .take(height as usize)
+    {
+        rgba.extend_from_slice(&row[..active_bytes_per_row]);
+    }
+    drop(mapped);
+    buffer.unmap();
+    Some(rgba)
+}
+
 fn encode_stage_texture_copy(
     encoder: &mut wgpu::CommandEncoder,
     texture: &wgpu::Texture,
@@ -1144,6 +1228,58 @@ fn build_static_warp_verts() -> Vec<WarpVert> {
         }
     }
     verts
+}
+
+fn build_comp_indices() -> Vec<u16> {
+    let mut indices = Vec::with_capacity((COMP_GRID_W * COMP_GRID_H * 6) as usize);
+    let stride = COMP_GRID_W + 1;
+    for j in 0..COMP_GRID_H {
+        for i in 0..COMP_GRID_W {
+            let a = i + stride * j;
+            let b = i + stride * (j + 1);
+            let c = i + 1 + stride * (j + 1);
+            let d = i + 1 + stride * j;
+            indices
+                .extend_from_slice(&[a as u16, b as u16, d as u16, b as u16, c as u16, d as u16]);
+        }
+    }
+    indices
+}
+
+fn generate_comp_verts(time: f32, rand_start: [f32; 4], verts: &mut Vec<CompVert>) {
+    let mut hue = [[1.0f32; 3]; 4];
+    for (i, corner) in hue.iter_mut().enumerate() {
+        corner[0] =
+            0.6 + 0.3 * (time * 30.0 * 0.0143 + 3.0 + i as f32 * 21.0 + rand_start[3]).sin();
+        corner[1] =
+            0.6 + 0.3 * (time * 30.0 * 0.0107 + 1.0 + i as f32 * 13.0 + rand_start[1]).sin();
+        corner[2] = 0.6 + 0.3 * (time * 30.0 * 0.0129 + 6.0 + i as f32 * 9.0 + rand_start[2]).sin();
+        let max_shade = corner[0].max(corner[1]).max(corner[2]);
+        for channel in corner {
+            *channel = 0.5 + 0.5 * (*channel / max_shade);
+        }
+    }
+
+    verts.clear();
+    verts.reserve(((COMP_GRID_W + 1) * (COMP_GRID_H + 1)) as usize);
+    for j in 0..=COMP_GRID_H {
+        let y = j as f32 / COMP_GRID_H as f32;
+        for i in 0..=COMP_GRID_W {
+            let x = i as f32 / COMP_GRID_W as f32;
+            let mut color = [0.0f32; 4];
+            for channel in 0..3 {
+                color[channel] = hue[0][channel] * x * y
+                    + hue[1][channel] * (1.0 - x) * y
+                    + hue[2][channel] * x * (1.0 - y)
+                    + hue[3][channel] * (1.0 - x) * (1.0 - y);
+            }
+            color[3] = 1.0;
+            verts.push(CompVert {
+                pos: [x * 2.0 - 1.0, 1.0 - y * 2.0],
+                color,
+            });
+        }
+    }
 }
 
 // PerFrame uniform buffer — layout must exactly match the WGSL PerFrame struct
@@ -1288,10 +1424,16 @@ fn milkdrop_angle(x: f64, y: f64, aspect_x: f64, aspect_y: f64) -> f64 {
 fn seed_equation_inputs(env: &mut Env, width: u32, height: u32) {
     env.insert("frame", 0.0);
     env.insert("time", 0.0);
-    env.insert("fps", 60.0);
-    for name in [
-        "bass", "bass_att", "mid", "mid_att", "treb", "treb_att", "vol", "vol_att",
-    ] {
+    // Match Butterchurn's `AudioLevels` state at `loadPreset`: instantaneous
+    // bands have not received a PCM/FFT row yet (zero), while the attenuated
+    // history starts at one. This setup frame is observable to per-frame,
+    // shape, and wave init equations, so using OjoDrop's former all-ones audio
+    // seed injected a phantom beat before real playback began.
+    env.insert("fps", 45.0);
+    for name in ["bass", "mid", "treb", "vol"] {
+        env.insert(name, 0.0);
+    }
+    for name in ["bass_att", "mid_att", "treb_att", "vol_att"] {
         env.insert(name, 1.0);
     }
     let (aspect_x, aspect_y) = if width >= height {
@@ -1749,15 +1891,45 @@ fn noise_bytes_scaled(n: usize, max_val: u8) -> Vec<u8> {
 // but no preset depends on exact noise values (only on having structured value
 // noise), so a deterministic seed is correct and reproducible for testing.
 
-/// xorshift32 PRNG returning values in [0, 1).
-fn bc_rng() -> impl FnMut() -> f32 {
-    let mut x: u32 = 0x1234_5678;
-    move || {
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        // 24 high bits → [0,1) (matches Math.random precision adequately)
-        ((x >> 8) as f32) / ((1u32 << 24) as f32)
+/// Butterchurn's seeded `xorshift128+` stream (`utils/seededRandom.js`).
+///
+/// The parity harness creates Butterchurn with its default deterministic seed
+/// (12345), and the renderer constructs `Noise` before any other random-consuming
+/// component.  Matching both the generator and its ten-value warm-up makes the
+/// LQ noise texture byte-for-byte equivalent at its base level, which matters for
+/// feedback presets that sample `sampler_noise_lq` directly.
+struct ButterchurnRng {
+    state: [u32; 4],
+}
+
+impl ButterchurnRng {
+    const DEFAULT_SEED: u32 = 12_345;
+
+    fn new(seed: u32) -> Self {
+        let mut rng = Self {
+            state: [
+                seed,
+                seed ^ 0x9e37_79b9,
+                seed ^ 0x6a09_e667,
+                seed ^ 0xbb67_ae85,
+            ],
+        };
+        for _ in 0..10 {
+            rng.next_unit();
+        }
+        rng
+    }
+
+    fn next_unit(&mut self) -> f64 {
+        let mut t = self.state[3];
+        let s = self.state[0];
+        self.state[3] = self.state[2];
+        self.state[2] = self.state[1];
+        self.state[1] = s;
+        t ^= t.wrapping_shl(11);
+        t ^= t >> 8;
+        self.state[0] = t ^ s ^ (s >> 19);
+        f64::from(self.state[0]) / 4_294_967_296.0
     }
 }
 
@@ -1796,12 +1968,12 @@ fn rd4(buf: &[u8], i: usize) -> [u8; 4] {
 }
 
 /// createNoiseTex (noise.js 318-399): size×size RGBA8 tiling value noise.
-fn create_noise_tex(size: usize, zoom: usize, rng: &mut impl FnMut() -> f32) -> Vec<u8> {
+fn create_noise_tex(size: usize, zoom: usize, rng: &mut impl FnMut() -> f64) -> Vec<u8> {
     let n = size; // noiseSize
     let mut buf = vec![0u8; n * n * 4];
 
     // Random lattice fill.
-    let range: f32 = if zoom > 1 { 216.0 } else { 256.0 };
+    let range: f64 = if zoom > 1 { 216.0 } else { 256.0 };
     let half = range * 0.5;
     for px in 0..(n * n) {
         for c in 0..4 {
@@ -1853,14 +2025,14 @@ fn create_noise_tex(size: usize, zoom: usize, rng: &mut impl FnMut() -> f32) -> 
 }
 
 /// createNoiseVolTex (noise.js 183-318): size³ RGBA8 tiling value noise.
-fn create_noise_vol_tex(size: usize, zoom: usize, rng: &mut impl FnMut() -> f32) -> Vec<u8> {
+fn create_noise_vol_tex(size: usize, zoom: usize, rng: &mut impl FnMut() -> f64) -> Vec<u8> {
     let n = size;
     let words_per_slice = n * n;
     let words_per_line = n;
     let mut buf = vec![0u8; n * n * n * 4];
 
     // Random lattice fill.
-    let range: f32 = if zoom > 1 { 216.0 } else { 256.0 };
+    let range: f64 = if zoom > 1 { 216.0 } else { 256.0 };
     let half = range * 0.5;
     for px in 0..(n * n * n) {
         for c in 0..4 {
@@ -2277,6 +2449,71 @@ pub(crate) fn needed_blur_levels(warp: Option<&str>, comp: Option<&str>) -> u8 {
 // compute_warp_verts is now a method on MilkdropRenderer (see impl block) — it
 // runs the per_pixel EEL program per vertex and composes the butterchurn warped UV.
 
+/// How feedback content is carried across a feedback/blur/comp target rebuild.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum CarryMode {
+    /// Preserve the top-left `min(old, new)` region (MilkDrop's legacy
+    /// output-resize behaviour). Byte-preserving when the dimensions match.
+    Crop,
+    /// UV-space bilinear resample of the whole page. Used on an internal-scale
+    /// transition so a scale change carries the full frame across the new size
+    /// with no black border or luminance collapse.
+    Resample,
+}
+
+/// Internal render dimensions for a given output size and internal scale.
+///
+/// A `scale` of `>= 1.0` (or any non-finite value) returns the output size
+/// UNCHANGED so the default path (`internal_scale == 1.0`) is byte-identical to
+/// rendering directly at the output resolution. A `scale` in `(0, 1)` shrinks
+/// both axes (rounded, clamped to `[1, output]`); aspect ratio is preserved up
+/// to rounding.
+fn scaled_internal_dims(w: u32, h: u32, scale: f32) -> (u32, u32) {
+    if !scale.is_finite() || scale >= 1.0 {
+        return (w, h);
+    }
+    let s = scale.max(f32::MIN_POSITIVE);
+    let iw = ((w as f32 * s).round() as u32).clamp(1, w.max(1));
+    let ih = ((h as f32 * s).round() as u32).clamp(1, h.max(1));
+    (iw, ih)
+}
+
+/// Hot-switchable fidelity/performance bundles for the OjoDrop MilkDrop path.
+///
+/// Each variant bundles an internal render scale, a feedback mip-chain cap, and
+/// whether the FXAA output pass runs. [`MilkdropPerformanceProfile::Reference`]
+/// (the default) is full fidelity and byte-identical to the pre-profile
+/// behaviour: native internal resolution, the full feedback mip chain, and FXAA
+/// enabled. The `*60` variants trade fidelity for headroom and are meant to be
+/// selected by a downstream governor; nothing selects them automatically.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum MilkdropPerformanceProfile {
+    /// Full fidelity. Internal scale 1.0, full feedback mips, FXAA on. Default.
+    #[default]
+    Reference,
+    /// Native resolution and full feedback mips, but the FXAA output pass is
+    /// dropped (its own final AA is expected downstream).
+    High60,
+    /// Slightly reduced internal resolution with the FXAA pass dropped.
+    Balanced60,
+    /// Aggressive rescue: reduced internal resolution, a capped feedback mip
+    /// chain, and no FXAA pass.
+    Rescue60,
+}
+
+impl MilkdropPerformanceProfile {
+    /// `(internal_scale, feedback_mip_cap, fxaa_enabled)` for this profile.
+    /// `feedback_mip_cap == u32::MAX` means "no cap" (the full log2 chain).
+    fn params(self) -> (f32, u32, bool) {
+        match self {
+            MilkdropPerformanceProfile::Reference => (1.0, u32::MAX, true),
+            MilkdropPerformanceProfile::High60 => (1.0, u32::MAX, false),
+            MilkdropPerformanceProfile::Balanced60 => (0.83, u32::MAX, false),
+            MilkdropPerformanceProfile::Rescue60 => (0.67, 4, false),
+        }
+    }
+}
+
 // ----- main renderer struct --------------------------------------------------
 
 pub struct MilkdropRenderer {
@@ -2394,6 +2631,9 @@ pub struct MilkdropRenderer {
     /// pipeline was removed (P2-VIS-016); it was never rendered.
     warp_custom_pipeline: wgpu::RenderPipeline,
     comp_pipeline: wgpu::RenderPipeline,
+    comp_vert_buf: wgpu::Buffer,
+    comp_idx_buf: wgpu::Buffer,
+    comp_idx_count: u32,
     blur_h_pipeline: wgpu::RenderPipeline,
     blur_v_pipeline: wgpu::RenderPipeline,
     // FXAA output pass: COMP → comp_view (offscreen Rgba8Unorm) → FXAA → swapchain.
@@ -2406,6 +2646,30 @@ pub struct MilkdropRenderer {
     #[allow(dead_code)]
     fxaa_ubo: wgpu::Buffer,
     fxaa_bg: wgpu::BindGroup,
+    /// Runtime toggle for the FXAA output pass. Default `true` (COMP → offscreen
+    /// comp intermediate → FXAA → swapchain). When `false`, COMP writes the
+    /// swapchain directly and both the FXAA pass and the intermediate
+    /// write/read round-trip are skipped — reserved for a downstream tier that
+    /// provides its own final anti-aliasing.
+    fxaa_enabled: bool,
+    /// Internal render scale in `(0, 1]`. `1.0` (default) renders the feedback,
+    /// blur pyramid, and comp target at the full output resolution — byte-
+    /// identical to the pre-scale behaviour. Values `< 1.0` shrink those
+    /// internal targets and the final comp/FXAA pass upscales to the output.
+    internal_scale: f32,
+    /// Internal render dimensions == `scaled_internal_dims(width, height,
+    /// internal_scale)`. These size every internal target (feedback ping-pong,
+    /// blur pyramid, comp) and drive the per-frame render-canvas uniforms. At
+    /// `internal_scale == 1.0` they equal `(width, height)`.
+    render_w: u32,
+    render_h: u32,
+    /// Cap on the number of feedback ping-pong mip levels allocated AND
+    /// regenerated each frame. `u32::MAX` (default) means the full log2 chain
+    /// (byte-identical). Does NOT affect the separate blur pyramid.
+    feedback_mip_cap: u32,
+    /// Currently selected performance profile (bundles `internal_scale`,
+    /// `feedback_mip_cap`, and `fxaa_enabled`). Defaults to `Reference`.
+    perf_profile: MilkdropPerformanceProfile,
     // standard warp mesh (used when no custom warp shader)
     warp_mesh_pipeline: wgpu::RenderPipeline,
     warp_mesh_bg_a: wgpu::BindGroup, // reads from tex_a, repeat
@@ -2508,6 +2772,14 @@ pub struct MilkdropRenderer {
     /// Butterchurn-shaped 512-bin FFT magnitude array for `bSpectrum` custom
     /// waveforms. Empty when no live audio (built-in/synthetic path uses time data).
     freq_spectrum: Vec<f32>,
+    /// Optional exact Butterchurn shader random vectors for the next frame. This
+    /// is chiefly useful to make an offline parity capture independent of each
+    /// renderer's internal PRNG implementation.
+    frame_random_override: Option<([f32; 4], [f32; 4])>,
+    /// Optional Butterchurn shader clock for the next frame. Offscreen parity
+    /// capture can replay Butterchurn's smoothed-FPS clock exactly instead of
+    /// merely approximating it with a fixed wall-clock cadence.
+    frame_time_override: Option<f64>,
     pub width: u32,
     pub height: u32,
 
@@ -2795,11 +3067,15 @@ impl MilkdropRenderer {
         let tex_binding = wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_DST
             | wgpu::TextureUsages::RENDER_ATTACHMENT;
-        let mut rng = bc_rng();
+        let mut noise_rng = ButterchurnRng::new(ButterchurnRng::DEFAULT_SEED);
+        let mut rng = || noise_rng.next_unit();
+        // Match `Noise` construction order in Butterchurn exactly. The stream is
+        // shared across all six textures, so merely using the same PRNG is not
+        // enough when the allocation order differs.
         let n_lq = create_noise_tex(256, 1, &mut rng);
+        let n_lite = create_noise_tex(32, 1, &mut rng);
         let n_mq = create_noise_tex(256, 4, &mut rng);
         let n_hq = create_noise_tex(256, 8, &mut rng);
-        let n_lite = create_noise_tex(32, 1, &mut rng);
         let nv_lq = create_noise_vol_tex(32, 1, &mut rng);
         let nv_hq = create_noise_vol_tex(32, 4, &mut rng);
 
@@ -3073,12 +3349,51 @@ impl MilkdropRenderer {
             immediate_size: 0,
         });
 
-        // Vertex shader (shared by all passes)
+        // Fullscreen vertex shader shared by non-mesh passes.
         let quad_src = include_str!("shaders/quad.wgsl");
         let quad_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("quad-vs"),
             source: wgpu::ShaderSource::Wgsl(quad_src.into()),
         });
+
+        // Butterchurn comp mesh: fixed 32x24 topology with a dynamic per-vertex
+        // hue field. Custom comp shaders observe it as `hue_shader`.
+        let mut initial_comp_verts = Vec::new();
+        // Replaced with the preset's actual rand_start before the first draw.
+        generate_comp_verts(0.0, [0.0; 4], &mut initial_comp_verts);
+        let comp_indices = build_comp_indices();
+        let comp_vert_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("comp-mesh-verts"),
+            contents: bytemuck::cast_slice(&initial_comp_verts),
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        });
+        let comp_idx_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("comp-mesh-indices"),
+            contents: bytemuck::cast_slice(&comp_indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        let comp_idx_count = comp_indices.len() as u32;
+        let comp_mesh_src = include_str!("shaders/comp_mesh.wgsl");
+        let comp_mesh_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("comp-mesh-vs"),
+            source: wgpu::ShaderSource::Wgsl(comp_mesh_src.into()),
+        });
+        let comp_vbl = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<CompVert>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &[
+                wgpu::VertexAttribute {
+                    offset: 0,
+                    shader_location: 0,
+                    format: wgpu::VertexFormat::Float32x2,
+                },
+                wgpu::VertexAttribute {
+                    offset: 8,
+                    shader_location: 1,
+                    format: wgpu::VertexFormat::Float32x4,
+                },
+            ],
+        };
 
         // Comp pipeline
         let comp_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -3089,10 +3404,10 @@ impl MilkdropRenderer {
             label: Some("comp-pipeline"),
             layout: Some(&comp_pl),
             vertex: wgpu::VertexState {
-                module: &quad_mod,
+                module: &comp_mesh_mod,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[],
+                buffers: &[comp_vbl],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &comp_mod,
@@ -4418,6 +4733,9 @@ impl MilkdropRenderer {
             blur3_ubo,
             warp_custom_pipeline,
             comp_pipeline,
+            comp_vert_buf,
+            comp_idx_buf,
+            comp_idx_count,
             blur_h_pipeline,
             blur_v_pipeline,
             comp_tex,
@@ -4426,6 +4744,15 @@ impl MilkdropRenderer {
             fxaa_bgl,
             fxaa_ubo,
             fxaa_bg,
+            fxaa_enabled: true,
+            // Default = Reference profile: native internal resolution, full
+            // feedback mip chain. Constructed targets are built at (w, h), so
+            // these match the initial allocation exactly (byte-identical path).
+            internal_scale: 1.0,
+            render_w: w,
+            render_h: h,
+            feedback_mip_cap: u32::MAX,
+            perf_profile: MilkdropPerformanceProfile::Reference,
             warp_mesh_pipeline,
             warp_mesh_bg_a,
             warp_mesh_bg_b,
@@ -4473,6 +4800,7 @@ impl MilkdropRenderer {
             warp_state,
             scratch: RendererScratch {
                 warp_verts: Vec::with_capacity(((GRID_W + 1) * (GRID_H + 1)) as usize),
+                comp_verts: Vec::with_capacity(((COMP_GRID_W + 1) * (COMP_GRID_H + 1)) as usize),
                 motion_verts: Vec::with_capacity(MV_VERT_CAP),
                 darken_verts: Vec::with_capacity(12),
                 shape_fill_verts: Vec::new(),
@@ -4496,6 +4824,8 @@ impl MilkdropRenderer {
             audio: None,
             audio_att: None,
             freq_spectrum: Vec::new(),
+            frame_random_override: None,
+            frame_time_override: None,
             width: w,
             height: h,
             surface_format,
@@ -4718,7 +5048,33 @@ impl MilkdropRenderer {
         if self.width == w && self.height == h {
             return Ok(());
         }
-        validate_texture_dims(self.device.limits().max_texture_dimension_2d, w, h)?;
+        // Output-size change: crop-preserve the feedback (legacy behaviour). The
+        // internal targets are (re)built at `internal_scale` inside the rebuild.
+        self.rebuild_render_targets(w, h, CarryMode::Crop)
+    }
+
+    /// Rebuild every size- and mip-dependent GPU target (feedback ping-pong,
+    /// blur pyramid, comp) plus the bind groups and UBOs that reference them, at
+    /// the given OUTPUT size and the current `internal_scale`/`feedback_mip_cap`.
+    ///
+    /// The internal render dimensions are `scaled_internal_dims(out, scale)`;
+    /// they are bound to `(w, h)` here so the whole build below sizes the
+    /// internal targets from the scaled dimensions. `carry` chooses how the
+    /// previous feedback is brought forward. At `internal_scale == 1.0`,
+    /// `feedback_mip_cap == u32::MAX`, and `CarryMode::Crop`, this reproduces the
+    /// pre-scale resize exactly.
+    fn rebuild_render_targets(
+        &mut self,
+        out_w: u32,
+        out_h: u32,
+        carry: CarryMode,
+    ) -> Result<(), DimensionError> {
+        let (out_w, out_h) = (out_w.max(1), out_h.max(1));
+        validate_texture_dims(self.device.limits().max_texture_dimension_2d, out_w, out_h)?;
+        // Internal render size (== output at scale 1.0). All internal targets
+        // below are sized from these; the final comp/FXAA pass upscales to output.
+        let (w, h) = scaled_internal_dims(out_w, out_h, self.internal_scale);
+        let (old_rw, old_rh) = (self.render_w, self.render_h);
 
         let device = self.device.clone();
         let queue = self.queue.clone();
@@ -4727,7 +5083,9 @@ impl MilkdropRenderer {
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_DST
             | wgpu::TextureUsages::COPY_SRC;
-        let feedback_mip_levels = mip_level_count_2d(w, h);
+        // Cap the feedback mip chain (feedback only — the blur pyramid below is
+        // independent). Full chain (`u32::MAX` cap) is byte-identical.
+        let feedback_mip_levels = mip_level_count_2d(w, h).min(self.feedback_mip_cap).max(1);
         let tex_a =
             make_tex2d_with_mips(&device, &queue, w, h, fb_usage, feedback_mip_levels, None);
         let tex_b =
@@ -4786,16 +5144,42 @@ impl MilkdropRenderer {
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("milkdrop-resize-feedback-copy"),
         });
-        let copy_w = self.width.min(w);
-        let copy_h = self.height.min(h);
-        if copy_w > 0 && copy_h > 0 {
-            let extent = wgpu::Extent3d {
-                width: copy_w,
-                height: copy_h,
-                depth_or_array_layers: 1,
-            };
-            enc.copy_texture_to_texture(self.tex_a.as_image_copy(), tex_a.as_image_copy(), extent);
-            enc.copy_texture_to_texture(self.tex_b.as_image_copy(), tex_b.as_image_copy(), extent);
+        // When the internal dimensions are unchanged (e.g. a mip-cap change), a
+        // full-region copy is byte-preserving. A `Crop` carry preserves the
+        // top-left overlap (MilkDrop's legacy output-resize). A `Resample` carry
+        // on an actual dimension change UV-resamples the whole page so the frame
+        // survives an internal-scale transition without a black border.
+        let dims_unchanged = old_rw == w && old_rh == h;
+        if dims_unchanged || carry == CarryMode::Crop {
+            let copy_w = old_rw.min(w);
+            let copy_h = old_rh.min(h);
+            if copy_w > 0 && copy_h > 0 {
+                let extent = wgpu::Extent3d {
+                    width: copy_w,
+                    height: copy_h,
+                    depth_or_array_layers: 1,
+                };
+                enc.copy_texture_to_texture(
+                    self.tex_a.as_image_copy(),
+                    tex_a.as_image_copy(),
+                    extent,
+                );
+                enc.copy_texture_to_texture(
+                    self.tex_b.as_image_copy(),
+                    tex_b.as_image_copy(),
+                    extent,
+                );
+            }
+        } else {
+            // UV-space bilinear resample of BOTH ping-pong pages: a fullscreen
+            // blit from the old level-0 page (any size) into the new level-0
+            // page samples the full 0..1 UV range, so no border is left blank.
+            let old_view_a = mip_level_view(&self.tex_a, 0);
+            let old_view_b = mip_level_view(&self.tex_b, 0);
+            self.feedback_mip_blitter
+                .copy(&device, &mut enc, &old_view_a, &view_a);
+            self.feedback_mip_blitter
+                .copy(&device, &mut enc, &old_view_b, &view_b);
         }
         generate_mip_chain(
             &device,
@@ -5063,9 +5447,13 @@ impl MilkdropRenderer {
         self.shape_bg_read_b = shape_bg_read_b;
         self.shape_bg_read_a_clamp = shape_bg_read_a_clamp;
         self.shape_bg_read_b_clamp = shape_bg_read_b_clamp;
-        self.width = w;
-        self.height = h;
+        // Output size is what callers see; render size is the internal canvas.
+        self.width = out_w;
+        self.height = out_h;
+        self.render_w = w;
+        self.render_h = h;
         if self.geometry_diagnostics.enabled() {
+            // Diagnostic readback copies the internal canvas → size it to render.
             self.geometry_stage_readback = Some(GeometryStageReadback::new(&self.device, w, h));
         }
         Ok(())
@@ -5097,6 +5485,84 @@ impl MilkdropRenderer {
         self.custom_wave_adaptive_lod = enabled;
     }
 
+    /// Enable or disable the FXAA output pass. Enabled (the default) is the
+    /// full-fidelity path: COMP renders into the offscreen comp intermediate
+    /// and a 9-tap FXAA pass resolves it to the swapchain. Disabling routes COMP
+    /// straight to the swapchain and skips both the FXAA pass and the
+    /// intermediate write/read round-trip — intended for a downstream tier that
+    /// applies its own final anti-aliasing.
+    pub fn set_fxaa_enabled(&mut self, enabled: bool) {
+        self.fxaa_enabled = enabled;
+    }
+
+    /// Internal render scale in `(0, 1]`. `1.0` is native (default).
+    pub fn internal_scale(&self) -> f32 {
+        self.internal_scale
+    }
+
+    /// Set the internal render scale. Values `>= 1.0` (or non-finite) render at
+    /// native output resolution — byte-identical to the default. Values in
+    /// `(0, 1)` shrink the feedback/blur/comp targets; the final comp/FXAA pass
+    /// upscales to the output. A scale change that alters the internal
+    /// dimensions UV-resamples the feedback so the frame carries across without
+    /// a black border or luminance collapse. No-op if the scale is unchanged.
+    pub fn set_internal_scale(&mut self, scale: f32) {
+        let scale = if scale.is_finite() {
+            scale.clamp(f32::MIN_POSITIVE, 1.0)
+        } else {
+            1.0
+        };
+        if scale == self.internal_scale {
+            return;
+        }
+        self.internal_scale = scale;
+        // Rebuild at the current output size; resample the feedback across the
+        // (possibly) new internal dimensions. Dimensions are already valid.
+        let _ = self.rebuild_render_targets(self.width, self.height, CarryMode::Resample);
+    }
+
+    /// Current feedback mip-chain cap. `u32::MAX` means the full log2 chain.
+    pub fn feedback_mip_cap(&self) -> u32 {
+        self.feedback_mip_cap
+    }
+
+    /// Cap the number of feedback ping-pong mip levels allocated AND regenerated
+    /// each frame. `u32::MAX` (default) keeps the full log2 chain (byte-
+    /// identical); a lower cap trims the required-LOD tail. This is independent
+    /// of the separate blur pyramid. No-op if the cap is unchanged.
+    pub fn set_feedback_mip_cap(&mut self, cap: u32) {
+        let cap = cap.max(1);
+        if cap == self.feedback_mip_cap {
+            return;
+        }
+        self.feedback_mip_cap = cap;
+        // Dimensions are unchanged, so the feedback carries over losslessly; only
+        // the allocated/generated mip count changes.
+        let _ = self.rebuild_render_targets(self.width, self.height, CarryMode::Resample);
+    }
+
+    /// Currently selected performance profile.
+    pub fn performance_profile(&self) -> MilkdropPerformanceProfile {
+        self.perf_profile
+    }
+
+    /// Hot-switch the performance profile. Bundles `internal_scale`,
+    /// `feedback_mip_cap`, and `fxaa_enabled`. [`MilkdropPerformanceProfile::Reference`]
+    /// (the default) is byte-identical to the pre-profile behaviour. Only the
+    /// pipeline targets are rebuilt (and only when scale/cap actually change);
+    /// no shaders or pipelines are recompiled.
+    pub fn set_performance_profile(&mut self, profile: MilkdropPerformanceProfile) {
+        let (scale, mip_cap, fxaa) = profile.params();
+        self.perf_profile = profile;
+        self.fxaa_enabled = fxaa;
+        let rebuild = scale != self.internal_scale || mip_cap != self.feedback_mip_cap;
+        self.internal_scale = scale;
+        self.feedback_mip_cap = mip_cap;
+        if rebuild {
+            let _ = self.rebuild_render_targets(self.width, self.height, CarryMode::Resample);
+        }
+    }
+
     /// Opt in to compact CPU-side summaries of custom shape/wave geometry.
     /// Disabling collection also drops the latest retained snapshot.
     pub fn set_geometry_diagnostics_enabled(&mut self, enabled: bool) {
@@ -5105,12 +5571,12 @@ impl MilkdropRenderer {
             if !self
                 .geometry_stage_readback
                 .as_ref()
-                .is_some_and(|readback| readback.matches(self.width, self.height))
+                .is_some_and(|readback| readback.matches(self.render_w, self.render_h))
             {
                 self.geometry_stage_readback = Some(GeometryStageReadback::new(
                     &self.device,
-                    self.width,
-                    self.height,
+                    self.render_w,
+                    self.render_h,
                 ));
             }
         } else {
@@ -5132,6 +5598,14 @@ impl MilkdropRenderer {
         Some(diagnostics)
     }
 
+    /// Read the latest warp, overlay, and comp checkpoints as RGBA8 images.
+    /// Returns `None` unless diagnostics were enabled before rendering.
+    pub fn geometry_stage_images(&self) -> Option<MilkdropStageImages> {
+        self.geometry_stage_readback
+            .as_ref()?
+            .read_images(&self.device)
+    }
+
     /// Feed live audio reactivity for the next frame. Values are MilkDrop-style
     /// band levels (~1.0 = average energy, 0 = silent, >1 = loud). Once set, the
     /// synthetic sine-wave fallback is disabled.
@@ -5145,6 +5619,37 @@ impl MilkdropRenderer {
     /// non-att values (preserving the prior headless behavior bit-for-bit).
     pub fn set_audio_att(&mut self, bass_att: f32, mid_att: f32, treb_att: f32, vol_att: f32) {
         self.audio_att = Some([bass_att, mid_att, treb_att, vol_att]);
+    }
+
+    /// Override this frame's warp and comp `rand_frame` uniforms with values
+    /// captured from Butterchurn. The override is consumed by the next render;
+    /// normal renderer-owned random generation resumes when it is not supplied.
+    pub fn set_frame_randoms(&mut self, warp: [f32; 4], comp: [f32; 4]) {
+        self.frame_random_override = Some((warp, comp));
+    }
+
+    /// Override the shader `time` input for the next frame. The override is
+    /// consumed by the next render and leaves normal interactive timing intact.
+    pub fn set_frame_time_seconds(&mut self, time_seconds: f64) {
+        self.frame_time_override = time_seconds.is_finite().then_some(time_seconds);
+    }
+
+    /// Override the next shader clock and FPS inputs with a captured renderer's
+    /// values. This retains the supplied FPS for the frame's other EEL paths,
+    /// which derive their `fps` pseudo-variable from `time_per_frame`.
+    pub fn set_frame_timing(&mut self, time_seconds: f64, fps: f64) {
+        self.set_frame_time_seconds(time_seconds);
+        if fps.is_finite() && fps > 0.0 {
+            self.time_per_frame = Some(1.0 / fps);
+        }
+    }
+
+    /// Set the shader-visible frame number before the next render. Offline
+    /// Butterchurn captures start at frame 1, whereas a freshly created native
+    /// renderer naturally starts at zero; frame-dependent EEL must see the
+    /// captured value to preserve recursive presets.
+    pub fn set_frame_index(&mut self, frame_index: u64) {
+        self.frame_idx = frame_index;
     }
 
     /// Feed the Butterchurn-shaped 512-bin FFT magnitude array (`freqArray`) for
@@ -5682,7 +6187,7 @@ impl MilkdropRenderer {
         };
 
         // texsizeX / texsizeY (butterchurn) == internal render size, as f32.
-        let texsize_x = self.width as f32;
+        let texsize_x = self.render_w as f32;
 
         match new_wave_mode {
             0 => {
@@ -6320,7 +6825,11 @@ impl MilkdropRenderer {
         };
         let mut outputs = std::mem::take(&mut self.scratch.custom_wave_draws);
         outputs.clear();
-        if parallel_safe {
+        // Only dispatch onto the Rayon pool when there is more than one wave to
+        // evaluate: a 0- or 1-wave preset gains nothing from parallelism and the
+        // pool hand-off would only add scheduling overhead. Order-independent
+        // because the guarded case is already `parallel_safe`.
+        if parallel_safe && self.waves.len() > 1 {
             self.waves
                 .par_iter_mut()
                 .map(&build_wave)
@@ -6631,12 +7140,17 @@ impl MilkdropRenderer {
         surface_view: &wgpu::TextureView,
         timestamp_writes: Option<(&wgpu::QuerySet, &wgpu::Buffer, u32, u32)>,
     ) {
-        let t = deterministic_time_seconds(self.frame_idx, self.time_per_frame)
+        let t = self
+            .frame_time_override
+            .take()
+            .or_else(|| deterministic_time_seconds(self.frame_idx, self.time_per_frame))
             .unwrap_or_else(|| self.start.elapsed().as_secs_f64());
         let shader_t = shader_time_seconds(t);
         let shader_frame = shader_frame_index(self.frame_idx);
         let progress = shader_progress(t);
-        let (w, h) = (self.width as f32, self.height as f32);
+        // Internal render size drives the texsize uniform: shaders sample the
+        // feedback/blur targets, which are sized at the render (scaled) resolution.
+        let (w, h) = (self.render_w as f32, self.render_h as f32);
         // Butterchurn shader uniform convention: aspect.xy hold the geometry aspect
         // factors and aspect.zw hold their inverses. Geometry paths below use the
         // same values, so custom shaders and CPU geometry agree.
@@ -6820,8 +7334,8 @@ impl MilkdropRenderer {
             env.insert("aspecty".into(), if gay != 0.0 { 1.0 / gay } else { 1.0 });
             env.insert("meshx".into(), GRID_W as f64);
             env.insert("meshy".into(), GRID_H as f64);
-            env.insert("pixelsx".into(), self.width as f64);
-            env.insert("pixelsy".into(), self.height as f64);
+            env.insert("pixelsx".into(), self.render_w as f64);
+            env.insert("pixelsy".into(), self.render_h as f64);
             prog.run_with(env, &mut self.eel_state);
         }
         self.vol_prev = vol;
@@ -6900,29 +7414,27 @@ impl MilkdropRenderer {
                 eqd("b3x", self.b3x as f64),
             ];
             let fmin_dist = 0.1f32;
-            // Min-distance enforcement: when a level's [min,max] is narrower than
-            // fmin_dist, WIDEN it to fmin_dist about the midpoint (min down, max UP).
-            // Butterchurn's source sets BOTH to `a - fmin_dist*0.5` (a typo → max==min →
-            // scale=1/0=Inf/NaN); MilkDrop's intent (and the references we score against)
-            // is max = a + fmin_dist*0.5. Use PLUS for max to restore the 0.1 range.
+            // Preserve Butterchurn's published compatibility behavior exactly:
+            // narrow ranges assign BOTH endpoints to avg-0.05. This can produce
+            // Inf/NaN downstream, but widening the range gives a different image.
             if bmax[0] - bmin[0] < fmin_dist {
                 let a = (bmin[0] + bmax[0]) * 0.5;
                 bmin[0] = a - fmin_dist * 0.5;
-                bmax[0] = a + fmin_dist * 0.5;
+                bmax[0] = a - fmin_dist * 0.5;
             }
             bmax[1] = bmax[1].min(bmax[0]);
             bmin[1] = bmin[1].max(bmin[0]);
             if bmax[1] - bmin[1] < fmin_dist {
                 let a = (bmin[1] + bmax[1]) * 0.5;
                 bmin[1] = a - fmin_dist * 0.5;
-                bmax[1] = a + fmin_dist * 0.5;
+                bmax[1] = a - fmin_dist * 0.5;
             }
             bmax[2] = bmax[2].min(bmax[1]);
             bmin[2] = bmin[2].max(bmin[1]);
             if bmax[2] - bmin[2] < fmin_dist {
                 let a = (bmin[2] + bmax[2]) * 0.5;
                 bmin[2] = a - fmin_dist * 0.5;
-                bmax[2] = a + fmin_dist * 0.5;
+                bmax[2] = a - fmin_dist * 0.5;
             }
             // blur-shader scale/bias (normalize into [0,1]) — butterchurn getScaleAndBias.
             let mut scale = [1.0f32; 3];
@@ -7105,7 +7617,14 @@ impl MilkdropRenderer {
                 bytemuck::cast_slice(&self.scratch.warp_verts),
             );
         }
-        let warp_rand_frame = std::array::from_fn(|_| self.eel_rng.next_unit() as f32);
+        // Parity captures may provide the two vectors Butterchurn uploaded for
+        // this frame. In normal playback these continue to come from OjoDrop's
+        // preset-owned EEL stream.
+        let frame_random_override = self.frame_random_override.take();
+        let warp_rand_frame = frame_random_override
+            .as_ref()
+            .map(|(warp, _)| *warp)
+            .unwrap_or_else(|| std::array::from_fn(|_| self.eel_rng.next_unit() as f32));
         let regsnap = std::array::from_fn(|i| self.eel_env.slot_value(self.eel_reg_slots[i]));
 
         // ── Build shape + waveform geometry (BEFORE any render pass opens) ────
@@ -7198,7 +7717,9 @@ impl MilkdropRenderer {
             )
         });
 
-        let comp_rand_frame = std::array::from_fn(|_| self.eel_rng.next_unit() as f32);
+        let comp_rand_frame = frame_random_override
+            .map(|(_, comp)| comp)
+            .unwrap_or_else(|| std::array::from_fn(|_| self.eel_rng.next_unit() as f32));
         pf.rand_frame = warp_rand_frame;
         self.queue
             .write_buffer(&self.perframe_buf, 0, bytemuck::bytes_of(&pf));
@@ -7206,6 +7727,12 @@ impl MilkdropRenderer {
         comp_pf.rand_frame = comp_rand_frame;
         self.queue
             .write_buffer(&self.comp_perframe_buf, 0, bytemuck::bytes_of(&comp_pf));
+        generate_comp_verts(shader_t, self.rand_start, &mut self.scratch.comp_verts);
+        self.queue.write_buffer(
+            &self.comp_vert_buf,
+            0,
+            bytemuck::cast_slice(&self.scratch.comp_verts),
+        );
 
         // Upload all geometry up-front (no write_buffer inside a render pass).
         if !fill_verts.is_empty() {
@@ -7237,8 +7764,8 @@ impl MilkdropRenderer {
 
         // One texel-size uniform; the vertex shader expands thick lines/dots from
         // `instance_index`, replacing 4/9 CPU draw calls with one instanced draw.
-        let tsx = 2.0 / self.width as f32;
-        let tsy = 2.0 / self.height as f32;
+        let tsx = 2.0 / self.render_w as f32;
+        let tsy = 2.0 / self.render_h as f32;
         self.queue.write_buffer(
             &self.wave_off_buf,
             0,
@@ -7306,7 +7833,7 @@ impl MilkdropRenderer {
                 let dx2 = mv_dx;
                 let dy2 = mv_dy;
                 let len_mult = mv_l;
-                let min_len = 1.0 / self.width as f32;
+                let min_len = 1.0 / self.render_w as f32;
 
                 // Bilinear sample of the warp UV field; returns (fx2, 1.0-fy2) (V flip,
                 // matching butterchurn getMotionDir). Mesh = GRID_W x GRID_H.
@@ -7617,8 +8144,8 @@ impl MilkdropRenderer {
                 &mut enc,
                 write_texture,
                 &readback.post_warp,
-                self.width,
-                self.height,
+                self.render_w,
+                self.render_h,
                 readback.padded_bytes_per_row,
             );
         }
@@ -7721,7 +8248,6 @@ impl MilkdropRenderer {
             }
         }
         self.last_blur_pass_count = blur_pass_count;
-
         // Overlay pass loads the warp result and preserves MilkDrop's authored
         // draw order. It is intentionally separate so overlays cannot contaminate
         // GetBlur1/2/3 for the same frame.
@@ -7867,8 +8393,8 @@ impl MilkdropRenderer {
                 &mut enc,
                 write_texture,
                 &readback.post_overlays,
-                self.width,
-                self.height,
+                self.render_w,
+                self.render_h,
                 readback.padded_bytes_per_row,
             );
         }
@@ -7885,12 +8411,20 @@ impl MilkdropRenderer {
             feedback_mips,
         );
 
-        // --- COMP pass: read from curr, write to offscreen comp target ---
+        // --- COMP pass: read from curr, write to the comp target ---
+        // With FXAA enabled we render into the offscreen comp intermediate so the
+        // FXAA output pass can read it; with FXAA disabled we skip that round-trip
+        // and write the swapchain directly.
+        let comp_target: &wgpu::TextureView = if self.fxaa_enabled {
+            &self.comp_view
+        } else {
+            surface_view
+        };
         {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("comp"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.comp_view,
+                    view: comp_target,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -7906,7 +8440,9 @@ impl MilkdropRenderer {
             rp.set_pipeline(&self.comp_pipeline);
             rp.set_bind_group(0, comp_bg, &[]);
             rp.set_bind_group(1, &self.comp_perframe_bg, &[]);
-            rp.draw(0..3, 0..1);
+            rp.set_vertex_buffer(0, self.comp_vert_buf.slice(..));
+            rp.set_index_buffer(self.comp_idx_buf.slice(..), wgpu::IndexFormat::Uint16);
+            rp.draw_indexed(0..self.comp_idx_count, 0, 0..1);
         }
 
         if let Some(readback) = self.geometry_stage_readback.as_ref() {
@@ -7914,15 +8450,17 @@ impl MilkdropRenderer {
                 &mut enc,
                 &self.comp_tex,
                 &readback.post_comp,
-                self.width,
-                self.height,
+                self.render_w,
+                self.render_h,
                 readback.padded_bytes_per_row,
             );
         }
 
         // --- OUTPUT pass: FXAA the offscreen comp result → swapchain ---
         // Fullscreen triangle covers 100% → LoadOp::Clear (no needless read).
-        {
+        // Skipped entirely when FXAA is disabled: COMP already wrote the
+        // swapchain directly above, so there is nothing to resolve.
+        if self.fxaa_enabled {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("fxaa-output"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -8181,17 +8719,50 @@ mod tests {
     #[cfg(feature = "app")]
     use super::MilkdropRenderer;
     use super::{
-        blur_dimensions, compile_milkdrop_shader_bodies_from_parts, deterministic_time_seconds,
-        downsample_rgba_volume, effective_fps, emit_smoothed_wave_and_color, milkdrop_angle,
-        needed_blur_levels, resample_linear, resample_linear_into, rgba8_rgb_summary,
+        blur_dimensions, build_comp_indices, compile_milkdrop_shader_bodies_from_parts,
+        deterministic_time_seconds, downsample_rgba_volume, effective_fps,
+        emit_smoothed_wave_and_color, generate_comp_verts, milkdrop_angle, needed_blur_levels,
+        resample_linear, resample_linear_into, rgba8_rgb_summary, seed_equation_inputs,
         shader_frame_index, shader_progress, shader_time_seconds, smooth_wave_and_color,
-        summarize_custom_geometry, validate_texture_dims, BorderDraw, BorderVert, DimensionError,
-        GeometryDiagnosticCollector, MilkdropGeometryDiagnostics, MilkdropResizeDebouncer,
-        ShapeFillDraw, ShapeVert, WaveDraw, WaveVert, GPU_FRAME_WRAP, GPU_TIME_WRAP_SECONDS,
-        GRID_H, GRID_W, INTERACTIVE_RESIZE_DEBOUNCE,
+        summarize_custom_geometry, validate_texture_dims, BorderDraw, BorderVert, ButterchurnRng,
+        DimensionError, GeometryDiagnosticCollector, MilkdropGeometryDiagnostics,
+        MilkdropResizeDebouncer, ShapeFillDraw, ShapeVert, WaveDraw, WaveVert, COMP_GRID_H,
+        COMP_GRID_W, GPU_FRAME_WRAP, GPU_TIME_WRAP_SECONDS, GRID_H, GRID_W,
+        INTERACTIVE_RESIZE_DEBOUNCE,
     };
     use std::cell::Cell;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn preset_setup_audio_matches_butterchurn_audio_levels() {
+        let mut env = crate::equations::Env::new();
+        seed_equation_inputs(&mut env, 640, 360);
+        assert_eq!(env.get("fps"), Some(&45.0));
+        for key in ["bass", "mid", "treb", "vol"] {
+            assert_eq!(env.get(key), Some(&0.0), "{key}");
+        }
+        for key in ["bass_att", "mid_att", "treb_att", "vol_att"] {
+            assert_eq!(env.get(key), Some(&1.0), "{key}");
+        }
+    }
+
+    #[test]
+    fn butterchurn_noise_rng_matches_seeded_random_reference() {
+        let mut rng = ButterchurnRng::new(12_345);
+        let expected = [
+            0.588_103_490_881_621_8,
+            0.392_734_328_517_690_3,
+            0.806_113_125_290_721_7,
+            0.139_376_720_180_735,
+            0.852_549_671_428_278_1,
+            0.934_001_052_752_137_2,
+            0.789_350_499_166_175_7,
+            0.595_282_274_996_861_8,
+        ];
+        for value in expected {
+            assert!((rng.next_unit() - value).abs() < 1.0e-15);
+        }
+    }
 
     #[test]
     fn geometry_diagnostics_are_disabled_and_lazy_by_default() {
@@ -8332,6 +8903,8 @@ mod tests {
     #[test]
     fn canonical_mesh_and_blur_geometry_match_butterchurn() {
         assert_eq!((GRID_W, GRID_H), (48, 36));
+        assert_eq!((COMP_GRID_W, COMP_GRID_H), (32, 24));
+        assert_eq!(build_comp_indices().len(), 32 * 24 * 6);
         assert_eq!(
             blur_dimensions(1280, 720),
             [
@@ -8344,6 +8917,38 @@ mod tests {
             ]
         );
         assert_eq!(blur_dimensions(1, 1), [(16, 16); 6]);
+    }
+
+    #[test]
+    fn comp_hue_mesh_has_butterchurn_topology_and_normalized_colors() {
+        let mut vertices = Vec::new();
+        generate_comp_verts(1.25, [0.1, 0.2, 0.3, 0.4], &mut vertices);
+        assert_eq!(vertices.len(), 33 * 25);
+        assert_eq!(vertices[0].pos, [-1.0, 1.0]);
+        assert_eq!(vertices[32].pos, [1.0, 1.0]);
+        assert_eq!(vertices[24 * 33].pos, [-1.0, -1.0]);
+        assert!(vertices.iter().all(|vertex| {
+            vertex.color[3] == 1.0
+                && vertex.color[..3]
+                    .iter()
+                    .all(|channel| (0.5..=1.0).contains(channel))
+        }));
+    }
+
+    #[test]
+    fn comp_mesh_adapts_webgl_framebuffer_v_to_wgpu_texture_v() {
+        let shader = include_str!("shaders/comp_mesh.wgsl");
+        assert!(shader.contains("(1.0 - pos.y) * 0.5"));
+    }
+
+    #[test]
+    fn feedback_mesh_flips_milkdrop_v_for_wgpu_textures() {
+        let default_shader = include_str!("shaders/warp_mesh.wgsl");
+        let custom_shader = include_str!("shaders/warp_mesh_vs.wgsl");
+        for shader in [default_shader, custom_shader] {
+            assert!(shader.contains("1.0 - v.uv.y"));
+            assert!(shader.contains("1.0 - warp_uv.y"));
+        }
     }
 
     #[test]

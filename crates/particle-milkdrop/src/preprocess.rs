@@ -696,8 +696,22 @@ fn try_native_convert_hlsl(body: &str) -> Option<String> {
         );
         return None;
     }
+    // Converter-output cache (MILK-02 #6): the C++ conversion is a deterministic
+    // function of `body`, so a re-import of the same source reuses the prior GLSL
+    // and skips the expensive helper round-trip. Key encodes the entry point so a
+    // plain result can never be confused with an `_ex` result for the same body.
+    let key = ConverterInput::Plain {
+        body: body.to_string(),
+    };
+    let digest = converter_input_digest(&key);
+    if let Some(cached) = converter_cache_get(digest, &key) {
+        return Some(cached);
+    }
     match particle_milkdrop_converter_sys::convert_milk_shader(body) {
-        Ok(glsl_body) => Some(glsl_body),
+        Ok(glsl_body) => {
+            converter_cache_insert(digest, key, glsl_body.clone());
+            Some(glsl_body)
+        }
         Err(e) => {
             log::warn!("native HLSL converter failed (falling back to pure-Rust): {e}");
             None
@@ -715,12 +729,183 @@ fn try_native_convert_hlsl_ex(file_globals: &str, body: &str) -> Option<String> 
         log::debug!("native HLSL converter (_ex) skipped (const array)");
         return None;
     }
+    // Converter-output cache (MILK-02 #6): keyed on the exact inputs fed to the
+    // converter (`file_globals`, `body`, and the always-true `optimize` flag) so a
+    // re-import of the same source reuses the prior GLSL and skips the helper.
+    let key = ConverterInput::Ex {
+        file_globals: file_globals.to_string(),
+        body: body.to_string(),
+        optimize: true,
+    };
+    let digest = converter_input_digest(&key);
+    if let Some(cached) = converter_cache_get(digest, &key) {
+        return Some(cached);
+    }
     match particle_milkdrop_converter_sys::convert_milk_shader_ex(file_globals, body, true) {
-        Ok(glsl_body) => Some(glsl_body),
+        Ok(glsl_body) => {
+            converter_cache_insert(digest, key, glsl_body.clone());
+            Some(glsl_body)
+        }
         Err(e) => {
             log::warn!("native HLSL converter (_ex) failed (falling back to pure-Rust): {e}");
             None
         }
+    }
+}
+
+// ---- Converter-output cache (MILK-02 #6) ------------------------------------
+//
+// The native C++ HLSL→GLSL conversion (hlsl2glslfork + glsl-optimizer, run via
+// the out-of-process converter-sys helper) is the dominant preset-import latency
+// cost. It is a pure, deterministic function of its exact inputs, so re-importing
+// the same .milk otherwise re-runs the same expensive conversion. This bounded,
+// thread-safe LRU caches the converter OUTPUT keyed by those exact input bytes: a
+// hit returns byte-identical GLSL and skips the C++ work; any change to the source
+// yields a different key and re-converts (source-hash invalidation).
+//
+// Distinct from the compiled shader-BODY WGSL cache in milkdrop_runtime.rs (a
+// later stage); this caches the raw converter output. The idiom mirrors that
+// crate's `ByteBudgetLruCache`: a 64-bit digest fast-index plus a retained full
+// key that is compared on every lookup, so a digest collision can never return the
+// wrong GLSL.
+
+/// Byte budget for the converter-output cache. Bounds retained GLSL so preset
+/// churn cannot grow it without limit. Sized to match the compiled-body cache.
+#[cfg(feature = "milk-native-converter")]
+const CONVERTER_OUTPUT_CACHE_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+
+/// The exact inputs to one native-converter invocation. The variant encodes the
+/// entry point so a `convert_milk_shader(body)` result can never be confused with
+/// a `convert_milk_shader_ex(globals, body, _)` result for the same `body`.
+#[cfg(feature = "milk-native-converter")]
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum ConverterInput {
+    /// `convert_milk_shader(body)`.
+    Plain { body: String },
+    /// `convert_milk_shader_ex(file_globals, body, optimize)`.
+    Ex {
+        file_globals: String,
+        body: String,
+        optimize: bool,
+    },
+}
+
+#[cfg(feature = "milk-native-converter")]
+struct ConverterCacheEntry {
+    digest: u64,
+    key: ConverterInput,
+    glsl: String,
+    bytes: usize,
+}
+
+/// A byte-bounded LRU keyed by a `(digest, full input)` pair. The digest is the
+/// fast index; the full key is retained and compared on every lookup so digest
+/// collisions are verified rather than trusted. Total retained bytes are kept
+/// within `budget_bytes` by evicting least-recently-used entries. Mirrors
+/// `ByteBudgetLruCache` in milkdrop_runtime.rs.
+#[cfg(feature = "milk-native-converter")]
+struct ConverterOutputCache {
+    budget_bytes: usize,
+    total_bytes: usize,
+    /// Ordered least- to most-recently-used (front = LRU, back = MRU).
+    entries: Vec<ConverterCacheEntry>,
+}
+
+#[cfg(feature = "milk-native-converter")]
+impl ConverterOutputCache {
+    fn new(budget_bytes: usize) -> Self {
+        Self {
+            budget_bytes,
+            total_bytes: 0,
+            entries: Vec::new(),
+        }
+    }
+
+    /// Look up by digest, then CONFIRM the full key matches before returning
+    /// (collision verification). On a hit the entry is promoted to
+    /// most-recently-used.
+    fn get(&mut self, digest: u64, key: &ConverterInput) -> Option<String> {
+        let idx = self
+            .entries
+            .iter()
+            .position(|entry| entry.digest == digest && entry.key == *key)?;
+        let entry = self.entries.remove(idx);
+        let glsl = entry.glsl.clone();
+        self.entries.push(entry);
+        Some(glsl)
+    }
+
+    /// Insert (or replace) an entry, then evict LRU entries until the retained
+    /// total is within budget (always keeping at least the just-inserted entry).
+    fn insert(&mut self, digest: u64, key: ConverterInput, glsl: String) {
+        let bytes = glsl.len();
+        if let Some(idx) = self
+            .entries
+            .iter()
+            .position(|entry| entry.digest == digest && entry.key == key)
+        {
+            self.total_bytes -= self.entries[idx].bytes;
+            self.entries.remove(idx);
+        }
+        self.entries.push(ConverterCacheEntry {
+            digest,
+            key,
+            glsl,
+            bytes,
+        });
+        self.total_bytes += bytes;
+        self.evict_to_budget();
+    }
+
+    fn evict_to_budget(&mut self) {
+        while self.total_bytes > self.budget_bytes && self.entries.len() > 1 {
+            let evicted = self.entries.remove(0);
+            self.total_bytes -= evicted.bytes;
+        }
+    }
+}
+
+/// Stable 64-bit digest of a converter input, used as the cache's fast index.
+/// Digest equality is only a candidate match — the full key is always compared on
+/// lookup, so a hash collision can never return the wrong GLSL.
+#[cfg(feature = "milk-native-converter")]
+fn converter_input_digest(key: &ConverterInput) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The process-wide converter-output cache. The conversion helpers are free
+/// functions (not methods on the `!Send` renderer) and preset import may run on
+/// rayon worker threads, so the cache is guarded by its own `Mutex`.
+#[cfg(feature = "milk-native-converter")]
+fn converter_output_cache() -> &'static std::sync::Mutex<ConverterOutputCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<ConverterOutputCache>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        std::sync::Mutex::new(ConverterOutputCache::new(
+            CONVERTER_OUTPUT_CACHE_BUDGET_BYTES,
+        ))
+    })
+}
+
+/// Return the cached GLSL for `key`, if present (promoting it to MRU). A poisoned
+/// lock degrades to a miss (the caller re-runs the converter) rather than panics.
+#[cfg(feature = "milk-native-converter")]
+fn converter_cache_get(digest: u64, key: &ConverterInput) -> Option<String> {
+    converter_output_cache()
+        .lock()
+        .ok()
+        .and_then(|mut cache| cache.get(digest, key))
+}
+
+/// Store the fresh converter output for `key`. A poisoned lock skips the insert.
+#[cfg(feature = "milk-native-converter")]
+fn converter_cache_insert(digest: u64, key: ConverterInput, glsl: String) {
+    if let Ok(mut cache) = converter_output_cache().lock() {
+        cache.insert(digest, key, glsl);
     }
 }
 
@@ -2326,6 +2511,71 @@ fn parse_glsl_decl_line(line: &str) -> Option<(String, Vec<String>, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "milk-native-converter")]
+    #[test]
+    fn converter_cache_hit_returns_stored_output_and_miss_on_different_source() {
+        let mut cache = ConverterOutputCache::new(CONVERTER_OUTPUT_CACHE_BUDGET_BYTES);
+        let key_a = ConverterInput::Plain {
+            body: "ret = tex2D(sampler_main, uv).xyz;".to_string(),
+        };
+        let digest_a = converter_input_digest(&key_a);
+        assert!(cache.get(digest_a, &key_a).is_none(), "cold lookup misses");
+        cache.insert(digest_a, key_a.clone(), "GLSL_A".to_string());
+        // A hit returns the stored output verbatim (byte-identical to a fresh run).
+        assert_eq!(cache.get(digest_a, &key_a).as_deref(), Some("GLSL_A"));
+
+        // A different .milk source hashes to a different key → miss → re-convert.
+        let key_b = ConverterInput::Plain {
+            body: "ret = tex2D(sampler_main, uv).zyx;".to_string(),
+        };
+        let digest_b = converter_input_digest(&key_b);
+        assert!(cache.get(digest_b, &key_b).is_none());
+    }
+
+    #[cfg(feature = "milk-native-converter")]
+    #[test]
+    fn converter_cache_distinguishes_plain_and_ex_entry_points() {
+        let mut cache = ConverterOutputCache::new(CONVERTER_OUTPUT_CACHE_BUDGET_BYTES);
+        let body = "ret = tex2D(sampler_main, uv).xyz;".to_string();
+        let plain = ConverterInput::Plain { body: body.clone() };
+        let ex = ConverterInput::Ex {
+            file_globals: String::new(),
+            body,
+            optimize: true,
+        };
+        let plain_digest = converter_input_digest(&plain);
+        let ex_digest = converter_input_digest(&ex);
+        cache.insert(plain_digest, plain.clone(), "PLAIN".to_string());
+        cache.insert(ex_digest, ex.clone(), "EX".to_string());
+        // Same body, different entry point → distinct cached outputs, never confused.
+        assert_eq!(cache.get(plain_digest, &plain).as_deref(), Some("PLAIN"));
+        assert_eq!(cache.get(ex_digest, &ex).as_deref(), Some("EX"));
+    }
+
+    #[cfg(feature = "milk-native-converter")]
+    #[test]
+    fn converter_cache_evicts_lru_to_stay_within_byte_budget() {
+        // Budget holds ~2 of the 100-byte payloads; a third insert evicts the LRU.
+        let mut cache = ConverterOutputCache::new(250);
+        let payload = "x".repeat(100);
+        let mk = |i: usize| ConverterInput::Plain {
+            body: format!("body-{i}"),
+        };
+        for i in 0..3 {
+            let k = mk(i);
+            cache.insert(converter_input_digest(&k), k, payload.clone());
+        }
+        assert!(
+            cache.total_bytes <= 250,
+            "retained bytes stay within budget"
+        );
+        // Entry 0 (least-recently-used) was evicted; 1 and 2 remain.
+        let k0 = mk(0);
+        assert!(cache.get(converter_input_digest(&k0), &k0).is_none());
+        let k2 = mk(2);
+        assert!(cache.get(converter_input_digest(&k2), &k2).is_some());
+    }
 
     #[test]
     fn mutable_q_writes_use_private_fragment_slots() {

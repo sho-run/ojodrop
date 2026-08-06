@@ -591,7 +591,11 @@ impl EelProgram {
         // Lock once for the complete execution, while leaving buffer-free programs
         // entirely unsynchronized so independent custom waves can still run in
         // parallel.
-        let gmegabuf_handle = self.compiled.uses_gmegabuf.then(|| state.gmegabuf.clone());
+        let gmegabuf_handle = self
+            .compiled
+            .effects
+            .uses_gmegabuf()
+            .then(|| state.gmegabuf.clone());
         let mut gmegabuf_guard = gmegabuf_handle.as_ref().map(|handle| {
             handle
                 .lock()
@@ -609,7 +613,7 @@ impl EelProgram {
         state: &mut EelState,
         gmegabuf: &mut MegaBuf,
     ) {
-        debug_assert!(self.compiled.uses_gmegabuf);
+        debug_assert!(self.compiled.effects.uses_gmegabuf());
         self.run_with_optional_gmegabuf(env, state, Some(gmegabuf));
     }
 
@@ -664,15 +668,24 @@ impl EelProgram {
         self.compiled.symbols.iter().any(|symbol| symbol == name)
     }
 
+    /// The full compile-time [`EffectSummary`] for this program. The renderer
+    /// and later governors read the explicit fields (RNG, loops, private vs
+    /// global buffers, output-write set, point/shape carry) to decide parallel
+    /// execution, adaptive LOD, and shape-instance stratified sampling.
+    #[allow(dead_code)] // Staged MILK-02 Rescue lever + tests.
+    pub(crate) fn effect_summary(&self) -> EffectSummary {
+        self.compiled.effects
+    }
+
     pub(crate) fn uses_gmegabuf(&self) -> bool {
-        self.compiled.uses_gmegabuf
+        self.compiled.effects.uses_gmegabuf()
     }
 
     /// Whether this program can run concurrently with a different custom-wave
     /// pool. Private env/megabuf state, loops, and point-to-point carry are safe:
     /// only preset-wide state such as gmegabuf and the shared RNG serialize waves.
     pub(crate) fn custom_wave_parallel_safe(&self) -> bool {
-        self.compiled.custom_wave_parallel_safe
+        self.compiled.effects.custom_wave_parallel_safe()
     }
 
     /// Whether adaptive custom-wave point LOD may skip evaluations without
@@ -680,7 +693,18 @@ impl EelProgram {
     /// safety: loops, buffers, random calls, and non-output assignments can all
     /// carry state between authored points and therefore retain full density.
     pub(crate) fn custom_wave_lod_safe(&self) -> bool {
-        self.compiled.custom_wave_lod_safe
+        self.compiled.effects.custom_wave_lod_safe()
+    }
+
+    /// Whether the later MILK-02 shape-instance stratified-sampling lever may
+    /// decimate this per-shape program without dropping carried state. Broader
+    /// than [`custom_wave_lod_safe`](Self::custom_wave_lod_safe): the renderer
+    /// reseeds regs/`t`/`q` and every shape output between instances, so only
+    /// buffers, RNG, loops, and writes to custom (non-reset) names make a shape
+    /// stateful across instances.
+    #[allow(dead_code)] // Staged MILK-02 Rescue lever + tests.
+    pub(crate) fn shape_instance_carry_safe(&self) -> bool {
+        self.compiled.effects.shape_instance_carry_safe()
     }
 }
 
@@ -792,22 +816,219 @@ struct Code {
     ops: Vec<Instr>,
 }
 
+/// Bitmask over the six per-invocation reset outputs shared by per-pixel,
+/// custom-wave, and custom-shape programs (`x y r g b a`). The renderer reseeds
+/// these before every invocation, so assigning them never carries state forward.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub(crate) struct OutputWrites(u8);
+
+impl OutputWrites {
+    const X: u8 = 1 << 0;
+    const Y: u8 = 1 << 1;
+    const R: u8 = 1 << 2;
+    const G: u8 = 1 << 3;
+    const B: u8 = 1 << 4;
+    const A: u8 = 1 << 5;
+
+    /// The bit for a reset-output name, or `None` for any other symbol.
+    fn bit_for(name: &str) -> Option<u8> {
+        Some(match name {
+            "x" => Self::X,
+            "y" => Self::Y,
+            "r" => Self::R,
+            "g" => Self::G,
+            "b" => Self::B,
+            "a" => Self::A,
+            _ => return None,
+        })
+    }
+
+    fn set(&mut self, bit: u8) {
+        self.0 |= bit;
+    }
+
+    /// Whether the program assigns reset output `name` (one of `x y r g b a`).
+    #[allow(dead_code)] // Staged MILK-02 Rescue lever + tests.
+    pub(crate) fn writes(&self, name: &str) -> bool {
+        Self::bit_for(name).is_some_and(|bit| self.0 & bit != 0)
+    }
+
+    /// Whether the program assigns any of the six reset outputs.
+    #[allow(dead_code)] // Staged MILK-02 Rescue lever + tests.
+    pub(crate) fn any(&self) -> bool {
+        self.0 != 0
+    }
+
+    /// Raw bitmask (`X|Y|R|G|B|A`); exposed for tests and downstream tooling.
+    #[allow(dead_code)] // Staged MILK-02 Rescue lever + tests.
+    pub(crate) fn bits(&self) -> u8 {
+        self.0
+    }
+}
+
+/// Whether writing `name` is reset by the renderer before the next custom-shape
+/// instance runs, so the write cannot carry across instances. Mirrors the shape
+/// per-instance reseed in `renderer.rs` (the per-instance loop reseeds
+/// `reg00..reg99`, `t1..t8`, `q1..q32`, `instance`/`num_inst`, and every shape
+/// output var). Any other (custom) name persists in the shape's env and does
+/// carry. Frame globals are treated conservatively as non-reset here: shape code
+/// virtually never assigns them, and flagging such a write as carry only makes
+/// the shape-instance analysis stricter, never looser.
+fn is_shape_reset_var(name: &str) -> bool {
+    // Shape per-instance outputs plus the `instance`/`num_inst` indices, all
+    // reseeded from base before each instance runs (`renderer.rs`
+    // `ShapeEnvSlots` / `seed_shape_base_env` / per-instance loop).
+    const SHAPE_OUTPUTS: [&str; 24] = [
+        "x",
+        "y",
+        "r",
+        "g",
+        "b",
+        "a",
+        "r2",
+        "g2",
+        "b2",
+        "a2",
+        "rad",
+        "ang",
+        "sides",
+        "border_r",
+        "border_g",
+        "border_b",
+        "border_a",
+        "thickoutline",
+        "textured",
+        "tex_ang",
+        "tex_zoom",
+        "additive",
+        "instance",
+        "num_inst",
+    ];
+    if SHAPE_OUTPUTS.contains(&name) {
+        return true;
+    }
+    // `reg00..reg99` — three chars `reg` + exactly two ASCII digits.
+    if let Some(digits) = name.strip_prefix("reg") {
+        return digits.len() == 2 && digits.bytes().all(|byte| byte.is_ascii_digit());
+    }
+    // `q1..q32` and `t1..t8` — reseeded from the preset-global snapshot.
+    if let Some(digits) = name.strip_prefix('q') {
+        return matches!(digits.parse::<u32>(), Ok(n) if (1..=32).contains(&n));
+    }
+    if let Some(digits) = name.strip_prefix('t') {
+        return matches!(digits.parse::<u32>(), Ok(n) if (1..=8).contains(&n));
+    }
+    false
+}
+
+/// Compile-time effect summary for one EEL program. Pure metadata computed once
+/// at compile and consumed by the renderer to schedule parallel custom waves,
+/// gate adaptive custom-wave point LOD, decide gmegabuf locking, and (later)
+/// gate shape-instance stratified sampling. Nothing here changes evaluation or
+/// rendering: the derived [`uses_gmegabuf`](Self::uses_gmegabuf),
+/// [`custom_wave_parallel_safe`](Self::custom_wave_parallel_safe), and
+/// [`custom_wave_lod_safe`](Self::custom_wave_lod_safe) values are byte-identical
+/// to the three booleans they formalize.
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct EffectSummary {
+    /// Calls `rand` / `randint`; each call advances the shared RNG stream, so
+    /// skipping or reordering invocations changes results.
+    pub(crate) uses_rng: bool,
+    /// Contains a `loop(...)` or `while(...)` construct.
+    pub(crate) has_loops: bool,
+    /// Reads the pool-private `megabuf`.
+    pub(crate) reads_private_megabuf: bool,
+    /// Writes the pool-private `megabuf`.
+    pub(crate) writes_private_megabuf: bool,
+    /// Reads the preset-global `gmegabuf`.
+    pub(crate) reads_global_gmegabuf: bool,
+    /// Writes the preset-global `gmegabuf`.
+    pub(crate) writes_global_gmegabuf: bool,
+    /// Which of the six reset outputs (`x y r g b a`) the program assigns.
+    // Consumed by tests + the staged MILK-02 Rescue lever, not production yet.
+    #[allow(dead_code)]
+    pub(crate) output_writes: OutputWrites,
+    /// Assigns at least one symbol outside the custom-wave reset outputs
+    /// (`x y r g b a`); such a write persists to the next authored point.
+    pub(crate) writes_non_wave_output: bool,
+    /// Assigns at least one symbol outside the custom-shape reset set (see
+    /// [`is_shape_reset_var`]); such a write persists to the next shape instance.
+    // Read only through `shape_instance_carry_safe` (staged MILK-02 Rescue lever).
+    #[allow(dead_code)]
+    pub(crate) writes_non_shape_output: bool,
+}
+
+impl EffectSummary {
+    /// Reads or writes the pool-private `megabuf`.
+    pub(crate) fn uses_private_megabuf(&self) -> bool {
+        self.reads_private_megabuf || self.writes_private_megabuf
+    }
+
+    /// Reads or writes the preset-global `gmegabuf`.
+    pub(crate) fn uses_global_gmegabuf(&self) -> bool {
+        self.reads_global_gmegabuf || self.writes_global_gmegabuf
+    }
+
+    /// Touches either buffer (private or global) in any direction.
+    pub(crate) fn uses_any_megabuf(&self) -> bool {
+        self.uses_private_megabuf() || self.uses_global_gmegabuf()
+    }
+
+    /// Formalizes today's `uses_gmegabuf`: the program reads or writes the
+    /// preset-wide global buffer (private `megabuf` does not count).
+    pub(crate) fn uses_gmegabuf(&self) -> bool {
+        self.uses_global_gmegabuf()
+    }
+
+    /// Formalizes today's `custom_wave_parallel_safe`: distinct wave pools may
+    /// run concurrently unless they share preset-wide state (`gmegabuf`) or the
+    /// shared RNG stream. Private env/megabuf/point-carry stay pool-local.
+    pub(crate) fn custom_wave_parallel_safe(&self) -> bool {
+        !(self.uses_global_gmegabuf() || self.uses_rng)
+    }
+
+    /// Formalizes today's `custom_wave_lod_safe`: adaptive point LOD may skip
+    /// invocations only for pure, output-only programs. Buffers, RNG, loops, and
+    /// non-output assignments all carry state between authored points.
+    pub(crate) fn custom_wave_lod_safe(&self) -> bool {
+        !(self.uses_rng || self.has_loops || self.uses_any_megabuf() || self.writes_non_wave_output)
+    }
+
+    /// Whether per-point / per-instance state persists across invocations
+    /// through a non-output register/variable write or any megabuf/gmegabuf
+    /// access. (RNG carry is reported separately via [`uses_rng`](Self::uses_rng).)
+    #[allow(dead_code)] // Staged MILK-02 Rescue lever + tests.
+    pub(crate) fn point_carry(&self) -> bool {
+        self.writes_non_wave_output || self.uses_any_megabuf()
+    }
+
+    /// Whether the later MILK-02 shape-instance stratified-sampling lever may
+    /// decimate this per-shape program. Analogous to
+    /// [`custom_wave_lod_safe`](Self::custom_wave_lod_safe), but the renderer
+    /// reseeds regs/`t`/`q` and every shape output between instances, so those
+    /// writes do not carry — only buffers, RNG, loops, and writes to custom
+    /// (non-reset) names make a shape stateful across instances.
+    #[allow(dead_code)] // Staged MILK-02 Rescue lever + tests.
+    pub(crate) fn shape_instance_carry_safe(&self) -> bool {
+        !(self.uses_rng
+            || self.has_loops
+            || self.uses_any_megabuf()
+            || self.writes_non_shape_output)
+    }
+}
+
 struct CompiledProgram {
     code: Code,
     symbols: Vec<String>,
     op_count: usize,
-    custom_wave_parallel_safe: bool,
-    custom_wave_lod_safe: bool,
-    uses_gmegabuf: bool,
+    effects: EffectSummary,
 }
 
 struct Compiler {
     symbols: Vec<String>,
     symbol_ids: HashMap<String, u32>,
     op_count: usize,
-    custom_wave_parallel_safe: bool,
-    custom_wave_lod_safe: bool,
-    uses_gmegabuf: bool,
+    effects: EffectSummary,
 }
 
 impl CompiledProgram {
@@ -816,9 +1037,7 @@ impl CompiledProgram {
             symbols: Vec::new(),
             symbol_ids: HashMap::new(),
             op_count: 0,
-            custom_wave_parallel_safe: true,
-            custom_wave_lod_safe: true,
-            uses_gmegabuf: false,
+            effects: EffectSummary::default(),
         };
         let mut code = Code::default();
         for stmt in stmts {
@@ -829,9 +1048,7 @@ impl CompiledProgram {
             code,
             symbols: compiler.symbols,
             op_count: compiler.op_count,
-            custom_wave_parallel_safe: compiler.custom_wave_parallel_safe,
-            custom_wave_lod_safe: compiler.custom_wave_lod_safe,
-            uses_gmegabuf: compiler.uses_gmegabuf,
+            effects: compiler.effects,
         }
     }
 }
@@ -879,19 +1096,28 @@ impl Compiler {
                 // The renderer resets the six custom-wave outputs for every
                 // point. Any other assignment may intentionally carry into the
                 // next authored point, so downsampling would change semantics.
-                if !matches!(name.as_str(), "x" | "y" | "r" | "g" | "b" | "a") {
-                    self.custom_wave_lod_safe = false;
+                let name = name.as_str();
+                if let Some(bit) = OutputWrites::bit_for(name) {
+                    self.effects.output_writes.set(bit);
+                } else {
+                    self.effects.writes_non_wave_output = true;
+                }
+                // The shape per-instance reseed is broader (regs, t*, q*, and
+                // every shape output), so only custom names carry between shape
+                // instances.
+                if !is_shape_reset_var(name) {
+                    self.effects.writes_non_shape_output = true;
                 }
                 self.expr(rhs, code);
                 let id = self.symbol(name);
                 self.push(code, Instr::Store(id));
             }
             Expr::BufAssign(global, index, value) => {
-                self.custom_wave_lod_safe = false;
                 if *global {
-                    self.custom_wave_parallel_safe = false;
+                    self.effects.writes_global_gmegabuf = true;
+                } else {
+                    self.effects.writes_private_megabuf = true;
                 }
-                self.uses_gmegabuf |= *global;
                 self.expr(index, code);
                 self.expr(value, code);
                 self.push(code, Instr::BufWrite(*global));
@@ -929,7 +1155,7 @@ impl Compiler {
                     }
                 }
                 "loop" => {
-                    self.custom_wave_lod_safe = false;
+                    self.effects.has_loops = true;
                     if let Some(count) = args.first() {
                         self.expr(count, code);
                     } else {
@@ -939,17 +1165,17 @@ impl Compiler {
                     self.push(code, Instr::Loop(Box::new(body)));
                 }
                 "while" => {
-                    self.custom_wave_lod_safe = false;
+                    self.effects.has_loops = true;
                     let body = self.value_block(args);
                     self.push(code, Instr::While(Box::new(body)));
                 }
                 "megabuf" | "gmegabuf" => {
-                    self.custom_wave_lod_safe = false;
                     let global = name == "gmegabuf";
                     if global {
-                        self.custom_wave_parallel_safe = false;
+                        self.effects.reads_global_gmegabuf = true;
+                    } else {
+                        self.effects.reads_private_megabuf = true;
                     }
-                    self.uses_gmegabuf |= global;
                     if let Some(index) = args.first() {
                         self.expr(index, code);
                     } else {
@@ -960,8 +1186,7 @@ impl Compiler {
                 _ => {
                     let builtin = Builtin::from_name(name);
                     if matches!(builtin, Builtin::Rand | Builtin::RandInt) {
-                        self.custom_wave_parallel_safe = false;
-                        self.custom_wave_lod_safe = false;
+                        self.effects.uses_rng = true;
                     }
                     for arg in args {
                         self.expr(arg, code);
@@ -2209,6 +2434,120 @@ mod tests {
         }
     }
 
+    #[test]
+    fn effect_summary_reports_explicit_flags_for_representative_programs() {
+        // Pure output-only: nothing carries, everything is decimation-safe.
+        let pure =
+            EelProgram::parse("x=sin(sample)+value1; y=cos(sample)+value2;").effect_summary();
+        assert!(!pure.uses_rng);
+        assert!(!pure.has_loops);
+        assert!(!pure.uses_private_megabuf());
+        assert!(!pure.uses_global_gmegabuf());
+        assert!(!pure.uses_gmegabuf());
+        assert!(!pure.point_carry());
+        assert!(pure.custom_wave_parallel_safe());
+        assert!(pure.custom_wave_lod_safe());
+        assert!(pure.shape_instance_carry_safe());
+        assert!(pure.output_writes.any());
+        assert!(pure.output_writes.writes("x"));
+        assert!(pure.output_writes.writes("y"));
+        assert!(!pure.output_writes.writes("r"));
+        assert_eq!(pure.output_writes.bits(), OutputWrites::X | OutputWrites::Y);
+
+        // Stateful RNG: the shared stream advances, so it is neither parallel nor
+        // decimation safe, yet it carries no register/buffer state itself.
+        let rng = EelProgram::parse("x=rand(10);").effect_summary();
+        assert!(rng.uses_rng);
+        assert!(
+            !rng.point_carry(),
+            "rand carry is reported via uses_rng only"
+        );
+        assert!(!rng.custom_wave_parallel_safe());
+        assert!(!rng.custom_wave_lod_safe());
+        assert!(!rng.shape_instance_carry_safe());
+
+        // Private megabuf: pool-local, so waves may still run in parallel, but the
+        // buffer carries across invocations (no LOD, no shape decimation).
+        let private = EelProgram::parse("megabuf(1)+=x; x=megabuf(1);").effect_summary();
+        assert!(private.uses_private_megabuf());
+        assert!(!private.uses_global_gmegabuf());
+        assert!(!private.uses_gmegabuf());
+        assert!(private.point_carry());
+        assert!(private.custom_wave_parallel_safe());
+        assert!(!private.custom_wave_lod_safe());
+        assert!(!private.shape_instance_carry_safe());
+
+        // Global gmegabuf read and write: preset-wide state, serial scheduling.
+        for source in ["x=gmegabuf(3);", "gmegabuf(3)=x;"] {
+            let global = EelProgram::parse(source).effect_summary();
+            assert!(global.uses_global_gmegabuf(), "{source}");
+            assert!(global.uses_gmegabuf(), "{source}");
+            assert!(global.point_carry(), "{source}");
+            assert!(!global.custom_wave_parallel_safe(), "{source}");
+            assert!(!global.custom_wave_lod_safe(), "{source}");
+            assert!(!global.shape_instance_carry_safe(), "{source}");
+        }
+
+        // Looping: iteration is not decimation-safe, but a loop over reset
+        // outputs alone still parallelizes and carries no register/buffer state.
+        let looping = EelProgram::parse("loop(4,x=x+1);").effect_summary();
+        assert!(looping.has_loops);
+        assert!(!looping.point_carry());
+        assert!(looping.custom_wave_parallel_safe());
+        assert!(!looping.custom_wave_lod_safe());
+        assert!(!looping.shape_instance_carry_safe());
+    }
+
+    #[test]
+    fn shape_instance_carry_distinguishes_reset_globals_from_custom_state() {
+        // Regs, t*, q*, and every shape output are reseeded between instances, so
+        // a shape that only mutates those is decimation-safe ACROSS INSTANCES even
+        // though the same code is NOT custom-wave-LOD-safe (a wave never resets
+        // regs/q between points).
+        let reset_only =
+            EelProgram::parse("rad=rad*1.1; q1=q1+0.1; reg50=bass; ang=ang+t8;").effect_summary();
+        assert!(!reset_only.writes_non_shape_output);
+        assert!(reset_only.writes_non_wave_output);
+        assert!(reset_only.shape_instance_carry_safe());
+        assert!(!reset_only.custom_wave_lod_safe());
+        assert!(reset_only.custom_wave_parallel_safe());
+
+        // A custom (non-reset) variable persists in the shape env across
+        // instances, so decimating would drop carried state.
+        let custom_carry = EelProgram::parse("myvar=myvar+1; x=myvar;").effect_summary();
+        assert!(custom_carry.writes_non_shape_output);
+        assert!(!custom_carry.shape_instance_carry_safe());
+
+        // The EelProgram wrapper delegates to the summary.
+        assert!(EelProgram::parse("rad=rad*1.1; q1=q1+0.1;").shape_instance_carry_safe());
+        assert!(!EelProgram::parse("myvar=1; x=myvar;").shape_instance_carry_safe());
+
+        // Buffers and RNG carry across shape instances regardless of which vars
+        // they touch.
+        for source in ["rad=megabuf(1);", "rad=gmegabuf(1);", "r=rand(1); g=r;"] {
+            let program = EelProgram::parse(source).effect_summary();
+            assert!(
+                !program.shape_instance_carry_safe(),
+                "{source} must stay stateful"
+            );
+        }
+
+        // Reset-var name classifier boundaries.
+        for name in [
+            "x", "rad", "border_a", "reg00", "reg99", "q1", "q32", "t1", "t8",
+        ] {
+            assert!(is_shape_reset_var(name), "{name} should be a reset var");
+        }
+        for name in [
+            "reg100", "reg0", "q0", "q33", "t0", "t9", "myvar", "time", "bass",
+        ] {
+            assert!(
+                !is_shape_reset_var(name),
+                "{name} should not be a reset var"
+            );
+        }
+    }
+
     /// Focused CPU benchmark for the custom-wave workload. Ignored in normal
     /// tests; run with `cargo test --release eel_vm_custom_wave_benchmark --
     /// --ignored --nocapture` when changing the evaluator.
@@ -2437,8 +2776,8 @@ mod tests {
     fn compiled_program_classifies_and_reuses_one_gmegabuf_guard() {
         let local = EelProgram::parse("megabuf(1)=7; x=megabuf(1);");
         let global = EelProgram::parse("gmegabuf(1)=0; loop(4096, gmegabuf(1)+=1); x=gmegabuf(1);");
-        assert!(!local.compiled.uses_gmegabuf);
-        assert!(global.compiled.uses_gmegabuf);
+        assert!(!local.compiled.effects.uses_gmegabuf());
+        assert!(global.compiled.effects.uses_gmegabuf());
 
         let mut env = Env::new();
         let mut state = EelState::new();

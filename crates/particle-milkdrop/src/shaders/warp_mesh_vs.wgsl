@@ -85,10 +85,11 @@ fn vs_main(v: VIn) -> VOut {
     // Screen 0..1 DirectX-UV (matches quad.wgsl): top row (pos.y=+1) -> v=0.
     o.vUv     = vec2<f32>((v.pos.x + 1.0) * 0.5, (1.0 - v.pos.y) * 0.5);
     if (wp.flags.x >= 0.5) {
-        o.vWarpUv = v.uv;
+        o.vWarpUv = vec2<f32>(v.uv.x, 1.0 - v.uv.y);
         o.vDecay = v.decay;
     } else {
-        o.vWarpUv = default_warp(v.pos);
+        let warp_uv = default_warp(v.pos);
+        o.vWarpUv = vec2<f32>(warp_uv.x, 1.0 - warp_uv.y);
         o.vDecay = vec4<f32>(vec3<f32>(wp.transform2.z), 1.0);
     }
     return o;

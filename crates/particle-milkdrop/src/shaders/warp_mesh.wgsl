@@ -84,10 +84,11 @@ fn vs_main(v: VIn) -> VOut {
     var o: VOut;
     o.clip  = vec4<f32>(v.pos, 0.0, 1.0);
     if (wp.flags.x >= 0.5) {
-        o.uv = v.uv;
+        o.uv = vec2<f32>(v.uv.x, 1.0 - v.uv.y);
         o.decay = v.decay;
     } else {
-        o.uv = default_warp(v.pos);
+        let warp_uv = default_warp(v.pos);
+        o.uv = vec2<f32>(warp_uv.x, 1.0 - warp_uv.y);
         o.decay = vec4<f32>(vec3<f32>(wp.transform2.z), 1.0);
     }
     return o;
