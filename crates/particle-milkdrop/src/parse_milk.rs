@@ -12,14 +12,15 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-/// MilkDrop addresses exactly 4 custom waveforms and 4 custom shapes (slots
-/// 0..=3). Higher indices are not renderable, so an attacker-controlled sparse
-/// high slot index is ignored — matching MilkDrop/Butterchurn — rather than
-/// widening the parse. Bounding the slot count also bounds the indexed-key parse.
-const MAX_CUSTOM_WAVES: u32 = 4;
-const MAX_CUSTOM_SHAPES: u32 = 4;
+/// BeatDrop/MilkDrop addresses 16 custom waveforms and 16 custom shapes (slots
+/// 0..=15). Keep the direct-file parser consistent with the importer path while
+/// still rejecting sparse, attacker-controlled indices at or beyond that limit.
+const MAX_CUSTOM_WAVES: u32 = 16;
+const MAX_CUSTOM_SHAPES: u32 = 16;
 
 pub struct MilkShaders {
+    pub enhanced_audio: crate::enhanced_audio::EnhancedAudioConfig,
+    pub beatdrop_feedback: bool,
     pub warp: Option<String>,
     pub comp: Option<String>,
     /// When true, `warp`/`comp` hold already-GLSL shader BODIES (Butterchurn
@@ -120,9 +121,9 @@ pub struct MilkShaders {
     pub b3n: f32,
     pub b3x: f32, // blur3 min/max
 
-    // ── Custom shapes (up to 4) ──────────────────────────────────────────────
+    // ── Custom shapes (up to 16) ─────────────────────────────────────────────
     pub shapes: Vec<ShapeCode>,
-    // ── Custom waveforms (up to 4) ───────────────────────────────────────────
+    // ── Custom waveforms (up to 16) ──────────────────────────────────────────
     pub waves: Vec<CustomWaveDef>,
 }
 
@@ -244,6 +245,12 @@ impl Default for CustomWaveDef {
 
 pub fn parse(content: &str) -> MilkShaders {
     MilkShaders {
+        enhanced_audio: crate::enhanced_audio::EnhancedAudioConfig {
+            fft_attack: parse_float(content, "FFTAttack", 0.5),
+            fft_decay: parse_float(content, "FFTDecay", 0.7),
+            ..Default::default()
+        }.sanitized(),
+        beatdrop_feedback: parse_bool(content, "bOjoBeatDropFeedback", false),
         warp: extract_section(content, "warp_"),
         comp: extract_section(content, "comp_"),
         shaders_glsl: false, // .milk path = HLSL bodies (unchanged behavior).
@@ -800,26 +807,30 @@ mod tests {
 
     #[test]
     fn wave_slot_index_beyond_limit_is_ignored() {
-        // Slot 0 is in range; slot 7 exceeds MAX_CUSTOM_WAVES (4) and must be
+        // Slot 0 and slot 15 are in range; slot 16 exceeds MAX_CUSTOM_WAVES and must be
         // dropped, so an attacker-controlled sparse high index never allocates a
         // slot. The whole preset is bucketed in a single O(lines) pass.
         let content = "\
 wavecode_0_enabled=1
 wavecode_0_sep=120
-wavecode_7_enabled=1
-wavecode_7_sep=99
+wavecode_15_enabled=1
+wavecode_15_sep=99
+wavecode_16_enabled=1
+wavecode_16_sep=1
 ";
         let waves = parse_waves(content);
-        assert_eq!(waves.len(), 1, "only the in-range slot parses");
+        assert_eq!(waves.len(), 2, "only the 16 in-range slots parse");
         assert_eq!(waves[0].index, 0);
         assert!(waves[0].enabled);
+        assert_eq!(waves[1].index, 15);
+        assert_eq!(waves[1].sep, 99);
     }
 
     #[test]
     fn shape_slot_index_beyond_limit_is_ignored() {
-        let content = "shapecode_0_enabled=1\nshapecode_9_enabled=1\n";
+        let content = "shapecode_0_enabled=1\nshapecode_15_enabled=1\nshapecode_16_enabled=1\n";
         let shapes = parse_shapes(content);
-        assert_eq!(shapes.len(), 1);
+        assert_eq!(shapes.len(), 2);
     }
 
     #[test]
@@ -901,5 +912,75 @@ wavecode_7_sep=99
         let ok = parse("zoom=1.5\nshapecode_0_enabled=1\nshapecode_0_x=0.25\n");
         assert_eq!(ok.zoom, 1.5);
         assert_eq!(ok.shapes[0].base.x, 0.25);
+    }
+
+    // NaN/Inf boundary for .milk input: the existing test uses
+    // `1e999`, which overflows f64 as well as f32 and would be caught by
+    // almost any check. The subtler hostile input is a value that is
+    // perfectly finite as an f64 but overflows the f32 the field is
+    // stored in — `1e39` sits just past f32::MAX (~3.40e38). It must hit
+    // the same guard, and the boundary must be finiteness rather than
+    // magnitude: the largest representable f32 has to survive intact.
+    #[test]
+    fn f32_range_overflow_and_finite_extremes_are_distinguished() {
+        // Overflows f32 (but not f64) → rejected, field keeps its default.
+        let over_f32 = parse("zoom=1e39\n");
+        assert!(
+            over_f32.zoom.is_finite(),
+            "1e39 overflows f32 and must not survive as inf"
+        );
+        assert_eq!(
+            over_f32.zoom, 1.0,
+            "f32 overflow falls back to zoom default"
+        );
+
+        // Just inside the f32 range → preserved, not rejected.
+        let near_max = parse("zoom=3.0e38\n");
+        assert!(near_max.zoom.is_finite());
+        assert_eq!(
+            near_max.zoom, 3.0e38,
+            "a value inside the f32 range must be preserved verbatim"
+        );
+
+        // Subnormal edge → preserved (it parses finite).
+        let subnormal = parse("zoom=1e-45\n");
+        assert!(subnormal.zoom.is_finite());
+        assert_eq!(subnormal.zoom, 1e-45f32, "a subnormal must be preserved");
+
+        // Rust's float parser accepts several spellings of the poisoned
+        // values, case-insensitively and with a sign. Every one of them
+        // must fall back to the default rather than reach the renderer.
+        for spelling in [
+            "inf",
+            "+inf",
+            "-inf",
+            "INF",
+            "Inf",
+            "infinity",
+            "Infinity",
+            "-Infinity",
+            "nan",
+            "NaN",
+            "NAN",
+            "-nan",
+        ] {
+            let parsed = parse(&format!("zoom={spelling}\n"));
+            assert!(
+                parsed.zoom.is_finite(),
+                "`{spelling}` must not reach the renderer as a non-finite zoom"
+            );
+            assert_eq!(
+                parsed.zoom, 1.0,
+                "`{spelling}` must fall back to the zoom default"
+            );
+        }
+
+        // Indexed-scalar ingress takes the same f32-overflow path.
+        let shape = parse("shapecode_0_enabled=1\nshapecode_0_x=1e39\n");
+        assert_eq!(shape.shapes.len(), 1);
+        assert_eq!(
+            shape.shapes[0].base.x, 0.5,
+            "an f32-overflowing shape field falls back to its default"
+        );
     }
 }

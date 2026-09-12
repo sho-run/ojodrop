@@ -37,6 +37,8 @@ mod hpss_bus;
 mod linkwitz_riley;
 mod onset;
 mod predictive_drop;
+#[cfg(feature = "capture")]
+pub mod reconnect;
 mod resample;
 mod smoothing;
 mod spectrogram;
@@ -54,6 +56,8 @@ pub use capture::{native_loopback_available, CaptureConfig, CaptureSource};
 pub use dsp::Analyzer;
 pub use hpss::HpssHistory;
 pub use hpss_bus::{HpssBus, HpssLevels};
+#[cfg(feature = "capture")]
+pub use reconnect::{CaptureDecision, CaptureHealth, ReconnectState};
 #[cfg(feature = "capture")]
 pub use spectrogram::{SpectrogramPublisher, SpectrogramReader};
 pub use spectrogram::{

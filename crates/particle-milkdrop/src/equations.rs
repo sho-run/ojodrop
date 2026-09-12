@@ -3091,6 +3091,118 @@ mod tests {
         ));
     }
 
+    // Token/node-count boundary: the existing budget tests probe
+    // MAX_PARSE_NODES + 16, which an off-by-one in `bump_node` would still
+    // reject. Pin the edge itself: the flip from accepted to typed
+    // rejection must be sharp, and the accepted side must still EVALUATE
+    // correctly rather than merely parse.
+    #[test]
+    fn flat_chain_node_budget_edge_is_sharp() {
+        // `x = 1+1+…+1` with `terms` addends.
+        fn chain(terms: u32) -> String {
+            let mut src = String::from("x = 1");
+            for _ in 0..terms {
+                src.push_str("+1");
+            }
+            src.push(';');
+            src
+        }
+
+        // The predicate is monotone in `terms`, so binary-search the edge
+        // instead of parsing every length.
+        let (mut lo, mut hi) = (0u32, MAX_PARSE_NODES + 64);
+        assert!(EelProgram::try_parse(&chain(lo)).is_ok());
+        assert!(EelProgram::try_parse(&chain(hi)).is_err());
+        while hi - lo > 1 {
+            let mid = lo + (hi - lo) / 2;
+            if EelProgram::try_parse(&chain(mid)).is_ok() {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let last_ok = lo;
+        let first_rejected = hi;
+        assert_eq!(
+            first_rejected,
+            last_ok + 1,
+            "the edge must be a single step"
+        );
+
+        // Where the edge sits, exactly: one counted node per addend, so a
+        // chain of MAX_PARSE_NODES addends is the largest accepted and the
+        // next one breaches. This ties the observable limit to the
+        // constant — a change to either side moves this assertion.
+        assert_eq!(
+            last_ok, MAX_PARSE_NODES,
+            "each addend costs exactly one budgeted node"
+        );
+
+        // Accepted side: parses AND evaluates to the arithmetic answer.
+        let prog = EelProgram::try_parse(&chain(last_ok)).expect("edge-1 must parse");
+        let mut env = Env::new();
+        prog.run(&mut env);
+        assert_eq!(env["x"], f64::from(last_ok) + 1.0);
+
+        // Rejected side: the typed error naming the cap, not a panic and
+        // not a silently truncated program.
+        assert!(matches!(
+            EelProgram::try_parse(&chain(first_rejected)),
+            Err(ParseError::ExpressionTooLarge { limit }) if limit == MAX_PARSE_NODES
+        ));
+    }
+
+    // Parse-depth boundary: the parse-depth guard has a DIFFERENT
+    // policy from the node budget — `enter_parse` refuses to descend and
+    // the statement degrades, with no typed error. Pin that distinction
+    // so a future change cannot quietly convert one into the other.
+    #[test]
+    fn parse_depth_cap_degrades_without_typed_error_or_overflow() {
+        fn nested(levels: u32) -> String {
+            let mut src = String::from("x = ");
+            for _ in 0..levels {
+                src.push_str("if(1,");
+            }
+            src.push('7');
+            for _ in 0..levels {
+                src.push_str(",0)");
+            }
+            src.push(';');
+            src
+        }
+
+        // Well inside the cap: the nest evaluates to its innermost value.
+        let shallow = EelProgram::try_parse(&nested(8)).expect("shallow nesting must parse");
+        let mut env = Env::new();
+        shallow.run(&mut env);
+        assert_eq!(env["x"], 7.0);
+
+        // At and past the cap the guard stops the descent. Node cost here
+        // is ~2 per level, so at these depths the NODE budget cannot be
+        // what fires — this isolates the depth guard.
+        for levels in [PARSE_DEPTH_CAP, PARSE_DEPTH_CAP + 1, PARSE_DEPTH_CAP * 2] {
+            assert!(
+                levels * 4 < MAX_PARSE_NODES,
+                "depth probe must stay under the node budget"
+            );
+            let parsed = EelProgram::try_parse(&nested(levels));
+            let Ok(parsed) = parsed else {
+                panic!(
+                    "over-deep nesting must degrade rather than raise a typed error \
+                     (that is the node budget's job); {levels} levels was rejected"
+                );
+            };
+            // Bounded work, no stack overflow, and whatever survives is a
+            // finite value — never NaN/inf leaking from a partial parse.
+            let mut env = Env::new();
+            parsed.run(&mut env);
+            assert!(
+                env.get("x").copied().unwrap_or(0.0).is_finite(),
+                "degraded parse must still yield a finite value at {levels} levels"
+            );
+        }
+    }
+
     #[test]
     fn modest_operator_chain_still_parses() {
         // A legitimately sized chain (well under the budget) is unaffected.

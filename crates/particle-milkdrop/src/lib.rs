@@ -26,6 +26,8 @@
 //! only need the items re-exported at the crate root.
 
 pub mod equations;
+pub mod enhanced_audio;
+pub mod extended_waveforms;
 pub mod load_json;
 pub mod named_textures;
 pub mod parse_milk;

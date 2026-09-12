@@ -138,7 +138,10 @@ pub fn native_loopback_available() -> bool {
 }
 
 /// Capture configuration / preferences.
-#[derive(Clone, Copy, Debug)]
+// `PartialEq`/`Eq` added 2026-08-15 so `reconnect::next_capture_config`'s
+// device-fallback choice is assertable in a unit test. The struct is a single
+// `bool`, so the derives are total and add no semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CaptureConfig {
     /// Prefer a system-loopback source (post-volume desktop mix) over the mic
     /// when one can be found. When set, [`start`] tries, in order: a virtual

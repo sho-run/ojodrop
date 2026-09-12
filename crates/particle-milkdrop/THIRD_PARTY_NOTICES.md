@@ -1,5 +1,16 @@
 # Third-Party Notices & Attribution — OjoDrop
 
+## BeatDrop extended waveform geometry
+
+Base waveform modes 8–17 adapt geometry from
+[BeatDrop](https://github.com/OfficialIncubo/BeatDrop-Music-Visualizer), commit
+`945ae10ecf928d24717b64f4e1a69b2c100c4829`.
+Copyright (c) 2018 Maxim Volskiy and individual contributors. The complete
+BSD-3-Clause notice is retained in
+[`../../licenses/BeatDrop-BSD-3-Clause.txt`](../../licenses/BeatDrop-BSD-3-Clause.txt)
+and [`src/extended_waveforms.rs`](./src/extended_waveforms.rs).
+The notice must accompany binary distributions. No endorsement is implied.
+
 OjoDrop is MIT-licensed (see [`LICENSE`](./LICENSE)). It stands on the shoulders
 of the people who built MilkDrop, Butterchurn, and the open shader toolchain that
 makes in-process `.milk` ingestion possible. This file reproduces the notices

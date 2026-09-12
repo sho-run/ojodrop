@@ -82,10 +82,31 @@ pub fn load(content: &str) -> Result<MilkShaders, String> {
         .iter()
         .map(|(k, v)| (k.to_ascii_lowercase(), *v))
         .collect();
+    // Finiteness is enforced here, matching `parse_milk::parse_finite_f32`: a
+    // present-but-non-finite value keeps the field's default and is logged.
+    //
+    // The test is deliberately AFTER the narrowing cast, and that is the only
+    // placement that does anything. serde_json rejects an out-of-`f64`-range
+    // literal at the parse stage ("number out of range"), so the `f64` arriving
+    // here is always finite and a pre-cast check could never fire. The single
+    // remaining overflow boundary is the *cast*: a
+    // merely f32-out-of-range `1e300` is a perfectly finite `f64` that becomes
+    // `+inf` as an `f32`. The old `.map(|v| *v as f32)` had no check at all, so
+    // this loader was the unguarded twin of `parse_milk`, which has enforced
+    // finiteness on every scalar all along.
     let f = |key: &str, default: f32| -> f32 {
-        lc.get(&key.to_ascii_lowercase())
-            .map(|v| *v as f32)
-            .unwrap_or(default)
+        match lc.get(&key.to_ascii_lowercase()) {
+            Some(v) => {
+                let narrowed = *v as f32;
+                if narrowed.is_finite() {
+                    narrowed
+                } else {
+                    log::warn!("ignoring non-finite value `{v}` for `{key}` in JSON preset");
+                    default
+                }
+            }
+            None => default,
+        }
     };
     let b = |key: &str, default: bool| -> bool {
         match lc.get(&key.to_ascii_lowercase()) {
@@ -95,6 +116,12 @@ pub fn load(content: &str) -> Result<MilkShaders, String> {
     };
 
     Ok(MilkShaders {
+        enhanced_audio: crate::enhanced_audio::EnhancedAudioConfig {
+            fft_attack: f("fftattack", 0.5),
+            fft_decay: f("fftdecay", 0.7),
+            ..Default::default()
+        }.sanitized(),
+        beatdrop_feedback: b("bojobeatdropfeedback", false),
         // Butterchurn GLSL shader bodies → compiled via the GLSL-body path.
         warp: p.warp.clone().filter(|s| !s.trim().is_empty()),
         comp: p.comp.clone().filter(|s| !s.trim().is_empty()),
@@ -191,7 +218,7 @@ pub fn load(content: &str) -> Result<MilkShaders, String> {
 
 fn parse_json_shapes(shapes: &[JsonSubObj]) -> Vec<ShapeCode> {
     let mut out = Vec::new();
-    for s in shapes {
+    for s in shapes.iter().take(16) {
         let lc: HashMap<String, f64> = s
             .base_vals
             .iter()
@@ -282,7 +309,7 @@ fn parse_json_shapes(shapes: &[JsonSubObj]) -> Vec<ShapeCode> {
 
 fn parse_json_waves(waves: &[JsonSubObj]) -> Vec<CustomWaveDef> {
     let mut out = Vec::new();
-    for (n, w) in waves.iter().enumerate() {
+    for (n, w) in waves.iter().take(16).enumerate() {
         let lc: HashMap<String, f64> = w
             .base_vals
             .iter()
@@ -424,6 +451,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn json_presets_cannot_smuggle_a_non_finite_scalar_past_the_f32_narrowing() {
+        let json = r#"{"baseVals":{"b1n":1e300,"b1x":-1e300,"b2n":-1e300,"zoom":1e300}}"#;
+        // `MilkShaders` is not `Debug`, so unwrap by hand rather than `.expect`.
+        let Ok(s) = load(json) else {
+            panic!("preset must still load, with defaults substituted");
+        };
+        assert_eq!(s.b1n, 0.0, "b1n must fall back to its default, not +inf");
+        assert_eq!(s.b1x, 1.0, "b1x must fall back to its default, not -inf");
+        assert_eq!(s.b2n, 0.0, "b2n must fall back to its default");
+        assert_eq!(
+            s.zoom, 1.0,
+            "the guard is on the shared reader, not one field"
+        );
+        for (name, v) in [
+            ("b1n", s.b1n),
+            ("b1x", s.b1x),
+            ("b2n", s.b2n),
+            ("b2x", s.b2x),
+            ("b3n", s.b3n),
+            ("b3x", s.b3x),
+            ("zoom", s.zoom),
+            ("decay", s.decay),
+        ] {
+            assert!(v.is_finite(), "{name} reached MilkShaders as {v}");
+        }
+    }
+
+    /// The boundary of this guard's responsibility, pinned so it is not widened by
+    /// mistake: an out-of-`f64`-range literal never reaches the field reader at
+    /// all, because serde_json fails the whole document first. A reader who
+    /// assumes `1e400` arrives as an `f64` infinity — as an earlier draft of the
+    /// comment above did — is wrong.
+    #[test]
+    fn json_parse_rejects_out_of_f64_range_before_we_see_it() {
+        let Err(err) = load(r#"{"baseVals":{"b1n":1e400}}"#) else {
+            panic!("an out-of-f64-range literal must not load");
+        };
+        assert!(
+            err.contains("number out of range"),
+            "unexpected parse error: {err}"
+        );
+    }
+
+    /// Non-vacuity: ordinary in-range values are read exactly as before, including
+    /// ones near the f32 boundary. A guard that clamped magnitude rather than
+    /// testing finiteness would fail this.
+    #[test]
+    fn json_presets_keep_finite_values_including_large_in_range_magnitudes() {
+        let json = r#"{"baseVals":{"b1n":0.25,"b1x":0.75,"zoom":1.08,"decay":3.0e38}}"#;
+        let Ok(s) = load(json) else { panic!("load") };
+        assert_eq!(s.b1n, 0.25);
+        assert_eq!(s.b1x, 0.75);
+        assert_eq!(s.zoom, 1.08);
+        assert_eq!(s.decay, 3.0e38_f64 as f32);
+        assert!(s.decay.is_finite());
+    }
+
+    #[test]
     fn js_to_eel_pixel_line() {
         // The exact example from the task spec.
         let input = "a.x1=.00001<Math.abs(above(a.d,a.r))?0:Math.sin(a.y-a.cy1)*a.dir";
@@ -454,8 +539,6 @@ mod tests {
 
     #[test]
     fn json_custom_wave_sep_120_survives_load() {
-        // P2-VIS-011: a numeric custom-wave sep of 120 must survive the JSON
-        // importer as 120, not collapse to a boolean 1.
         let json = r#"{"waves":[{"baseVals":{"enabled":1,"sep":120}}]}"#;
         let s = load(json).expect("load json");
         assert_eq!(s.waves.len(), 1);

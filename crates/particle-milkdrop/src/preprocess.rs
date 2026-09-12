@@ -448,6 +448,71 @@ pub const MILKDROP_SAMPLERS: &[&str] = &[
     "sampler_noisevol_hq",
 ];
 
+/// The two existing named-texture sampler slots become the enhanced-audio route
+/// only for a shader that asks for one of these helpers. Keeping the route inside
+/// the fixed 16-slot table avoids growing the renderer's already-full sampler
+/// layout. The renderer must reject a preset that needs this route *and* a named
+/// texture atlas instead of silently rebinding one resource over the other.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MilkdropAuxSamplerRoute {
+    NamedTextureAtlas,
+    EnhancedAudio,
+}
+
+/// Explicit dynamic mapping for the two reusable sampler pairs.
+///
+/// The FFT uses the normally-linear named slot; the waveform uses the normally
+/// point-named slot but must receive a linear clamp sampler while this route is
+/// active, matching BeatDrop's non-anisotropic linear filtering for both rows.
+pub const ENHANCED_AUDIO_SAMPLER_ROUTE: MilkdropAuxSamplerRoute =
+    MilkdropAuxSamplerRoute::EnhancedAudio;
+pub const ENHANCED_AUDIO_FFT_SAMPLER: &str = "sampler_named_linear";
+pub const ENHANCED_AUDIO_WAVE_SAMPLER: &str = "sampler_named_point";
+
+const ENHANCED_AUDIO_HELPERS: &[&str] = &[
+    "get_fft",
+    "get_fft_hz",
+    "get_fft_peak",
+    "get_fft_peak_hz",
+    "get_wave",
+    "get_wave_left",
+    "get_wave_right",
+];
+
+/// Whether shader text invokes a BeatDrop enhanced-audio helper.
+///
+/// This checks identifier boundaries and a following `(` so a variable or a
+/// longer identifier (`get_fft_peak_color`) cannot activate the GPU route.
+pub fn uses_enhanced_audio_helpers(source: &str) -> bool {
+    let source = strip_comments(source);
+    ENHANCED_AUDIO_HELPERS
+        .iter()
+        .any(|helper| contains_function_call(&source, helper))
+}
+
+fn contains_function_call(source: &str, name: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut offset = 0;
+    while offset + name.len() <= bytes.len() {
+        let Some(found) = source[offset..].find(name) else {
+            return false;
+        };
+        let start = offset + found;
+        let end = start + name.len();
+        let before_is_ident = start > 0 && is_ident_byte(bytes[start - 1]);
+        let after_is_ident = end < bytes.len() && is_ident_byte(bytes[end]);
+        let mut next = end;
+        while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+            next += 1;
+        }
+        if !before_is_ident && !after_is_ident && next < bytes.len() && bytes[next] == b'(' {
+            return true;
+        }
+        offset = end;
+    }
+    false
+}
+
 /// Shared FS preamble: sampler/texture declarations, the PerFrame UBO block,
 /// q1..q8 defines, PI const, and the helper functions (GetMain/GetBlur*/saturate…).
 /// `io_decls` is the per-variant `in`/`out` declaration block (comp vs warp).
@@ -539,6 +604,35 @@ bvec4 m_and4(bvec4 a, bvec4 b) { return bvec4(a.x && b.x, a.y && b.y, a.z && b.z
 bvec2 m_or2(bvec2 a, bvec2 b)  { return bvec2(a.x || b.x, a.y || b.y); }
 bvec3 m_or3(bvec3 a, bvec3 b)  { return bvec3(a.x || b.x, a.y || b.y, a.z || b.z); }
 bvec4 m_or4(bvec4 a, bvec4 b)  { return bvec4(a.x || b.x, a.y || b.y, a.z || b.z, a.w || b.w); }
+
+// BeatDrop enhanced audio helpers. `sampler_named_linear` / `_point` are
+// dynamically routed to separate 1024x2 FFT-power and 512x2 stereo-wave textures
+// only when this API is used; see `ENHANCED_AUDIO_SAMPLER_ROUTE`. The second
+// sampler is deliberately bound with the renderer's *linear clamp* sampler in
+// that mode. FFT rows contain power, hence the sqrt, just like include.fx.
+float get_fft(float pos) {
+    return sqrt(max(texture(sampler2D(sampler_named_linear, sampler_named_linear_samp),
+                            vec2(clamp(pos, 0.0, 1.0), 0.25)).x, 0.0));
+}
+float get_fft_hz(float freq) {
+    return get_fft(freq / max(audio_nyquist_hz, 1.0));
+}
+float get_fft_peak(float pos) {
+    return sqrt(max(texture(sampler2D(sampler_named_linear, sampler_named_linear_samp),
+                            vec2(clamp(pos, 0.0, 1.0), 0.75)).x, 0.0));
+}
+float get_fft_peak_hz(float freq) {
+    return get_fft_peak(freq / max(audio_nyquist_hz, 1.0));
+}
+float get_wave_left(float pos) {
+    return texture(sampler2D(sampler_named_point, sampler_named_point_samp),
+                   vec2(clamp(pos, 0.0, 1.0), 0.25)).x;
+}
+float get_wave_right(float pos) {
+    return texture(sampler2D(sampler_named_point, sampler_named_point_samp),
+                   vec2(clamp(pos, 0.0, 1.0), 0.75)).x;
+}
+float get_wave(float pos) { return (get_wave_left(pos) + get_wave_right(pos)) * 0.5; }
 "#;
 
     format!(
@@ -596,6 +690,10 @@ layout(set = 1, binding = {ubo_bind}) uniform PerFrame {{
     float darken;
     float solarize;
     float invert;
+    // The host uploads the actual input Nyquist. BeatDrop's include hard-codes
+    // 22,050 Hz; retaining that assumption would mis-address current 48/96 kHz
+    // inputs. Renderer wiring owns this scalar's value and UBO layout.
+    float audio_nyquist_hz;
 }};
 
 #define q1  _qa.x
@@ -2973,6 +3071,59 @@ mod tests {
         ));
     }
 
+    // Source-size boundary: a source of exactly MAX_SHADER_BYTES
+    // is accepted; one byte more is refused. The existing test probes a
+    // source many kilobytes past the cap, which an off-by-one would still
+    // reject.
+    #[test]
+    fn shader_byte_budget_boundary_is_exact() {
+        // One long comment line, so the LINE budget cannot fire first and
+        // steal the boundary from the byte budget.
+        let at_cap = format!("//{}\n", "a".repeat(MAX_SHADER_BYTES - 3));
+        assert_eq!(at_cap.len(), MAX_SHADER_BYTES);
+        assert!(
+            try_butterchurn_to_naga(&at_cap).is_ok(),
+            "a source of exactly MAX_SHADER_BYTES must be accepted"
+        );
+
+        let one_over = format!("//{}\n", "a".repeat(MAX_SHADER_BYTES - 2));
+        assert_eq!(one_over.len(), MAX_SHADER_BYTES + 1);
+        match try_butterchurn_to_naga(&one_over) {
+            Err(PreprocessError::SourceTooLarge { bytes, limit }) => {
+                assert_eq!(bytes, MAX_SHADER_BYTES + 1);
+                assert_eq!(limit, MAX_SHADER_BYTES);
+            }
+            other => panic!("expected SourceTooLarge at MAX_SHADER_BYTES + 1, got {other:?}"),
+        }
+        // The infallible entry point degrades to an inert empty program
+        // rather than propagating a partial translation.
+        assert!(butterchurn_to_naga(&one_over).is_empty());
+    }
+
+    // Token-count and line-budget boundary: exactly
+    // MAX_SHADER_LINES lines is accepted, one line more is refused — and
+    // the refusal happens while scanning, so it stays under the byte
+    // budget and cannot be the byte guard firing instead.
+    #[test]
+    fn shader_line_budget_boundary_is_exact() {
+        let at_cap = "\n".repeat(MAX_SHADER_LINES);
+        assert!(at_cap.len() < MAX_SHADER_BYTES);
+        assert!(
+            try_butterchurn_to_naga(&at_cap).is_ok(),
+            "a source of exactly MAX_SHADER_LINES lines must be accepted"
+        );
+
+        let one_over = "\n".repeat(MAX_SHADER_LINES + 1);
+        assert!(one_over.len() < MAX_SHADER_BYTES);
+        match try_butterchurn_to_naga(&one_over) {
+            Err(PreprocessError::TooManyLines { lines, limit }) => {
+                assert_eq!(lines, MAX_SHADER_LINES + 1);
+                assert_eq!(limit, MAX_SHADER_LINES);
+            }
+            other => panic!("expected TooManyLines at MAX_SHADER_LINES + 1, got {other:?}"),
+        }
+    }
+
     #[test]
     fn normal_shader_still_preprocesses() {
         // A normal butterchurn shader converts correctly: version bump, precision
@@ -3188,6 +3339,44 @@ shader_body {\n\
             "inner={inner}"
         );
         assert!(!inner.contains("shader_body {"), "inner={inner}");
+    }
+
+    #[test]
+    fn enhanced_audio_helper_detection_requires_real_calls() {
+        assert!(uses_enhanced_audio_helpers("ret = get_fft_peak_hz(440.0);"));
+        assert!(uses_enhanced_audio_helpers("ret = get_wave ( uv.x );"));
+        assert!(!uses_enhanced_audio_helpers("float get_fft_peak_color = 1.0;"));
+        assert!(!uses_enhanced_audio_helpers("float get_fft = 1.0;"));
+        assert!(!uses_enhanced_audio_helpers("// get_fft(0.5)\nret=GetMain(uv);"));
+        assert!(!uses_enhanced_audio_helpers("/* get_wave(uv.x) */ ret=GetMain(uv);"));
+        assert_eq!(ENHANCED_AUDIO_SAMPLER_ROUTE, MilkdropAuxSamplerRoute::EnhancedAudio);
+    }
+
+    #[test]
+    fn enhanced_audio_hlsl_and_glsl_helpers_compile() {
+        // Raw HLSL deliberately takes the native-converter bypass: its fixed
+        // prefix lacks `audio_nyquist_hz`. The Rust fallback retains every helper
+        // call and the resulting GLSL must compile through naga.
+        let hlsl = r#"shader_body {
+float fft = get_fft(0.25);
+float fft_hz = get_fft_hz(440.0);
+float peak = get_fft_peak(0.50);
+float peak_hz = get_fft_peak_hz(880.0);
+float wave = get_wave(uv.x);
+float left = get_wave_left(uv.x);
+float right = get_wave_right(uv.x);
+ret = float3(fft + fft_hz + peak, peak_hz + wave, left + right);
+}"#;
+        let hlsl_glsl = hlsl_milk_body_to_naga(hlsl);
+        assert!(hlsl_glsl.contains("float get_fft_hz(float freq)"));
+        assert!(hlsl_glsl.contains("audio_nyquist_hz"));
+        crate::renderer::compile_glsl(&hlsl_glsl)
+            .unwrap_or_else(|err| panic!("enhanced HLSL helper did not compile: {err}\n{hlsl_glsl}"));
+
+        let glsl = "ret = vec3(get_wave_left(uv.x), get_wave_right(uv.x), get_fft_hz(1000.0));";
+        let glsl_source = glsl_milk_body_to_naga(glsl);
+        crate::renderer::compile_glsl(&glsl_source)
+            .unwrap_or_else(|err| panic!("enhanced GLSL helper did not compile: {err}\n{glsl_source}"));
     }
 }
 
@@ -5739,8 +5928,15 @@ pub fn hlsl_milk_body_to_naga(body: &str) -> String {
     // Split at `shader_body { }` to get file-scope globals and the body separately.
     let (before, inner) = split_shader_body_wrapper(body);
     #[cfg(feature = "milk-native-converter")]
+    let enhanced_audio_helpers = uses_enhanced_audio_helpers(body);
+    #[cfg(feature = "milk-native-converter")]
     {
-        if !before.is_empty() && before_has_function_defs(&before) {
+        // The isolated converter's fixed HLSL prefix has no `audio_nyquist_hz`
+        // uniform. Route helper shaders through the real Rust fallback instead:
+        // it preserves the calls, emits the GLSL helper definitions below, and is
+        // validated by naga. Do not substitute BeatDrop's hard-coded 22,050 Hz.
+        if !enhanced_audio_helpers {
+            if !before.is_empty() && before_has_function_defs(&before) {
             let (func_defs, non_func_rest) = extract_function_defs(&before);
             let body_src = if non_func_rest.trim().is_empty() {
                 inner.clone()
@@ -5756,7 +5952,7 @@ pub fn hlsl_milk_body_to_naga(body: &str) -> String {
             if let Some(glsl_body) = try_native_convert_hlsl_ex(&file_globals, &deduped_body) {
                 return glsl_milk_body_to_naga(&glsl_body);
             }
-        } else {
+            } else {
             // Combine before + inner, strip any HLSL sampler decls that would cause
             // "opaque variable must be declared uniform" failures in glsl-optimizer,
             // then dedup and try the native converter.
@@ -5771,6 +5967,7 @@ pub fn hlsl_milk_body_to_naga(body: &str) -> String {
             let (deduped, _) = dedup_hlsl_declarations(&pre_stripped);
             if let Some(glsl_body) = try_native_convert_hlsl(&deduped) {
                 return glsl_milk_body_to_naga(&glsl_body);
+            }
             }
         }
     }
@@ -5856,8 +6053,14 @@ void main() {{
 pub fn hlsl_milk_warp_body_to_naga(body: &str) -> String {
     let (before, inner) = split_shader_body_wrapper(body);
     #[cfg(feature = "milk-native-converter")]
+    let enhanced_audio_helpers = uses_enhanced_audio_helpers(body);
+    #[cfg(feature = "milk-native-converter")]
     {
-        let native_result = if !before.is_empty() && before_has_function_defs(&before) {
+        // See the COMP path above. The converter cannot receive the dynamic
+        // sample-rate uniform, so helper shaders deliberately use the bounded
+        // Rust conversion path and the generated GLSL helper implementations.
+        if !enhanced_audio_helpers {
+            let native_result = if !before.is_empty() && before_has_function_defs(&before) {
             let (func_defs, non_func_rest) = extract_function_defs(&before);
             let body_src = if non_func_rest.trim().is_empty() {
                 inner.clone()
@@ -5875,7 +6078,7 @@ pub fn hlsl_milk_warp_body_to_naga(body: &str) -> String {
                 &alias_with_customs(&body_src, &customs),
             ));
             try_native_convert_hlsl_ex(&file_globals, &deduped_body)
-        } else {
+            } else {
             let stripped = if before.is_empty() {
                 inner.clone()
             } else {
@@ -5886,9 +6089,10 @@ pub fn hlsl_milk_warp_body_to_naga(body: &str) -> String {
                 &alias_with_customs(&stripped, &customs),
             ));
             try_native_convert_hlsl(&deduped)
-        };
-        if let Some(glsl_body) = native_result {
-            return glsl_milk_warp_body_to_naga(&glsl_body);
+            };
+            if let Some(glsl_body) = native_result {
+                return glsl_milk_warp_body_to_naga(&glsl_body);
+            }
         }
     }
     if before_has_function_defs(&before) {

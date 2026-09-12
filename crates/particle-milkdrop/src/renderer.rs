@@ -4,16 +4,21 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use wgpu::util::DeviceExt;
 
+use crate::enhanced_audio::{
+    EnhancedAudioConfig, EnhancedAudioProcessor, ENHANCED_FFT_BINS, ENHANCED_WAVE_SAMPLES,
+    LEGACY_ASSUMED_SAMPLE_RATE_HZ,
+};
 use crate::equations::{EelProgram, EelRng, EelState, Env, EnvSlot, EnvSnapshot, MegaBuf};
+use crate::extended_waveforms::{build_extended_waveform, ExtendedWaveformInput};
 use crate::named_textures::{
     NamedTexturePlan, NamedTextureResolver, DEFAULT_NAMED_TEXTURE_LAYER_SIZE,
 };
 use crate::parse_milk::{CustomWaveDef, MilkShaders, ShapeBaseVals};
 use crate::preprocess::{
-    fix_glsl_vector_types, glsl_milk_body_to_naga_with_named_textures,
+    custom_sampler_names, fix_glsl_vector_types, glsl_milk_body_to_naga_with_named_textures,
     glsl_milk_warp_body_to_naga_with_named_textures, hlsl_milk_body_to_naga_with_named_textures,
     hlsl_milk_warp_body_to_naga_with_named_textures, normalize_milkdrop_sampler_variants,
-    MILKDROP_SAMPLERS,
+    uses_enhanced_audio_helpers, MILKDROP_SAMPLERS,
 };
 
 // ── Warp mesh constants ──────────────────────────────────────────────────────
@@ -31,6 +36,82 @@ const GPU_FRAME_WRAP: u64 = 1 << 24;
 /// storm. 150 ms keeps the final image responsive while coalescing the normal
 /// stream of platform resize events into one state-preserving resize.
 pub const INTERACTIVE_RESIZE_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Selects the feedback provenance used by an individual MilkDrop renderer.
+///
+/// [`Self::Legacy`] preserves OjoDrop's established ordering: warp the prior
+/// feedback, build blur from that warped image, then composite motion vectors
+/// and overlays. [`Self::Beatdrop`] is an explicit compatibility experiment:
+/// motion vectors are first written into the prior feedback page, blur is built
+/// from that page, and warp subsequently samples the same page. The default is
+/// deliberately legacy so loading an existing preset cannot change its output.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FeedbackProvenance {
+    #[default]
+    Legacy,
+    Beatdrop,
+}
+
+/// Exact capability result for OjoDrop's native shared-feedback transition.
+///
+/// The bounded implementation blends evaluated mesh UVs before a single shared
+/// feedback sample. It also supports a useful subset of shaderless overlays:
+/// untextured, borderless custom shapes plus built-in/custom waves are emitted
+/// from both advancing states at complementary opacity. It does *not* claim
+/// parity for arbitrary custom warp/comp shader pairs, textured/dynamic shapes,
+/// motion vectors, darken-center, or frame borders. Callers must retain their
+/// ordinary texture transition as the fallback for every other result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SharedFeedbackSupport {
+    /// Supported bounded path: one shared feedback history and two advancing
+    /// renderer states. It is restricted to feedback-only presets. Their
+    /// built-in comp uniforms are interpolated before the final comp pass.
+    /// Per-pixel warp equations may run in both states; per-frame equations are
+    /// admitted only when they never reference a comp or overlay control that
+    /// this first path does not blend.
+    FeedbackOnlyInterpolatedComp,
+    /// Supported shaderless path with untextured, borderless shapes and/or
+    /// built-in/custom waves. The outgoing geometry is weighted by `1-progress`
+    /// and the target's independently evaluated geometry by `progress` in the
+    /// common post-warp overlay pass; built-in COMP uniforms are interpolated.
+    UntexturedOverlaysInterpolatedComp,
+    /// Both arguments identify the same renderer, so a two-state transition is
+    /// meaningless and would violate the bounded-state contract.
+    SameRenderer,
+    /// Feedback texture copies require the same underlying wgpu device.
+    /// Renderer workers may wrap `device.clone()` in separate `Arc`s; those are
+    /// accepted through `wgpu::Device` equality. Separately created device
+    /// instances (even on the same adapter) cannot copy each other's textures.
+    DifferentDevice,
+    /// The renderers do not target the same host output format.
+    DifferentSurfaceFormat,
+    /// The renderers have different output or internal feedback dimensions.
+    DifferentDimensions,
+    /// Custom warp or comp shaders are deliberately not claimed by v1.
+    CustomShadersUnsupported,
+    /// A textured or dynamically-programmed shape, shape border, motion vector,
+    /// darken-center, or frame border is present. These require a separate
+    /// overlay target or specialised ordering and must use the caller fallback.
+    VisibleOverlaysUnsupported,
+    /// Built-in COMP contains a non-interpolable control: an enabled hue shader,
+    /// mismatched echo orientation, or mismatched post-FX flag. These branch in
+    /// the COMP shader, so blending their raw f32 UBO words would create a
+    /// midpoint discontinuity at promotion.
+    DiscreteCompUnsupported,
+    /// Per-frame equations can modify composition/overlay values after a
+    /// capability check. This first path permits only per-frame programs that
+    /// reference warp controls and non-visual state.
+    PerFrameCompOrOverlayUnsupported,
+}
+
+impl SharedFeedbackSupport {
+    pub fn is_supported(self) -> bool {
+        matches!(
+            self,
+            Self::FeedbackOnlyInterpolatedComp | Self::UntexturedOverlaysInterpolatedComp
+        )
+    }
+}
 
 /// Axis-aligned clip-space bounds of emitted custom geometry for one OjoDrop
 /// frame. This is populated only when geometry diagnostics are explicitly
@@ -222,6 +303,42 @@ fn finite_clamp(value: f32, min: f32, max: f32, fallback: f32) -> f32 {
         value.clamp(min, max)
     } else {
         fallback
+    }
+}
+
+/// Public-ingress floor for a MilkDrop band level (`bass`/`mid`/`treb`/`vol`).
+/// Non-finite becomes `0.0` (silence); negatives clamp up to it. See
+/// [`MilkdropRenderer::set_audio`] for why this is a floor and not a policy.
+fn audio_level_floor(value: f32) -> f32 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
+}
+
+/// Public-ingress floor for a MilkDrop attenuation rail (`*_att`). These are
+/// DIVISORS in preset equations, so zero is as dangerous as `NaN`: anything not
+/// finite-and-strictly-positive becomes `1.0`, the documented average-energy
+/// baseline. See [`MilkdropRenderer::set_audio_att`].
+fn audio_att_floor(value: f32) -> f32 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        1.0
+    }
+}
+
+fn finite_f32_from_f64(value: f64, default: f64) -> f32 {
+    let narrowed = value as f32;
+    if narrowed.is_finite() {
+        return narrowed;
+    }
+    let fallback = default as f32;
+    if fallback.is_finite() {
+        fallback
+    } else {
+        0.0
     }
 }
 
@@ -517,9 +634,6 @@ const _: () = assert!(std::mem::size_of::<DarkenVert>() == 24);
 const SIDES_MAX: usize = 100;
 // Each shape instance contributes (sides+2) fill verts.
 const SHAPE_FILL_VERTS_MAX: usize = SIDES_MAX + 2;
-// Upper bound on instances generated for one custom shape. A preset-controlled
-// `num_inst` is clamped to this BEFORE any CPU per-instance work so an absurd
-// count can't drive unbounded geometry/EEL evaluation (P2-VIS-018).
 const MAX_SHAPE_INSTANCES: usize = 1024;
 // Static fan index count = sides*3 for sides<=100 → 300.
 const SHAPE_FAN_IDX_MAX: usize = SIDES_MAX * 3;
@@ -527,13 +641,11 @@ const SHAPE_FAN_IDX_MAX: usize = SIDES_MAX * 3;
 // Some cream-of-the-crop presets use 512/1024-instanced shape arrays; the old 8k
 // cap skipped most of those fans and left otherwise-live presets nearly black.
 const SHAPE_VERT_CAP: usize = 65536;
-// Waveform vertex capacity (built-in + custom). 4 waves × ~1023 verts (512 samples,
-// line-strip) ≈ 4092 — right at the old 4096 cap, so the 4th wave of multi-wave
-// presets overflowed the upload and drew from a stale buffer tail.
-const WAVE_VERT_CAP: usize = 16384;
-// Sane upper bound on the per-frame audio arrays (PCM waveform + FFT spectrum).
-// Real feeds are ~512 samples; this 16× headroom bounds the CPU waveform-geometry
-// work + scratch allocations so a pathological feed can't blow up (P2-VIS-018).
+// Waveform vertex capacity (built-in + custom). Sixteen custom line waves can
+// each emit 1023 smoothed vertices; an extended built-in waveform can append
+// another 1023 vertices (or two half-size strips). 20×1024 preserves that
+// legitimate BeatDrop/OjoDrop combination without stale-tail draws.
+const WAVE_VERT_CAP: usize = 20 * 1024;
 const MAX_AUDIO_SAMPLES: usize = 8192;
 // Border vertex capacity (per-frame across all shapes).
 const BORDER_VERT_CAP: usize = 65536;
@@ -563,6 +675,11 @@ struct RendererScratch {
     shape_border_draws: Vec<BorderDraw>,
     wave_verts: Vec<WaveVert>,
     wave_draws: Vec<WaveDraw>,
+    /// Reused weighted copies of the incoming state's compatible overlay
+    /// vertices. The target retains its full-opacity CPU geometry so it can be
+    /// promoted immediately after an interrupted shared-feedback morph.
+    shared_shape_fill_verts: Vec<ShapeVert>,
+    shared_wave_verts: Vec<WaveVert>,
     frame_border_verts: Vec<BorderVert>,
     frame_border_draws: Vec<(u32, u32)>,
     border_uniform_bytes: Vec<u8>,
@@ -1230,6 +1347,35 @@ fn build_static_warp_verts() -> Vec<WarpVert> {
     verts
 }
 
+/// Blend two independently evaluated warp meshes before the GPU samples the
+/// shared feedback page. This is deliberately mesh-space blending, not a
+/// dissolve of two completed feedback images. Invalid target values retain the
+/// already-sanitized outgoing value so a bad incoming EEL program cannot poison
+/// the shared history.
+fn blend_evaluated_warp_mesh(
+    outgoing: &mut [WarpVert],
+    incoming: &[WarpVert],
+    progress: f32,
+) -> bool {
+    if outgoing.len() != incoming.len() || !progress.is_finite() {
+        return false;
+    }
+    let weight = progress.clamp(0.0, 1.0);
+    for (old, new) in outgoing.iter_mut().zip(incoming) {
+        for channel in 0..2 {
+            if new.uv[channel].is_finite() {
+                old.uv[channel] += (new.uv[channel] - old.uv[channel]) * weight;
+            }
+        }
+        for channel in 0..4 {
+            if new.decay[channel].is_finite() {
+                old.decay[channel] += (new.decay[channel] - old.decay[channel]) * weight;
+            }
+        }
+    }
+    true
+}
+
 fn build_comp_indices() -> Vec<u16> {
     let mut indices = Vec::with_capacity((COMP_GRID_W * COMP_GRID_H * 6) as usize);
     let stride = COMP_GRID_W + 1;
@@ -1337,9 +1483,55 @@ struct PerFrame {
     darken: f32,             // 392
     solarize: f32,           // 396
     invert: f32,             // 400
-    _pad: [f32; 3],          // 404 → pad to 416
+    audio_nyquist_hz: f32,  // 404 — enhanced-audio Hz helpers
+    _pad: [f32; 2],          // 408 → pad to 416
 }
 const _: () = assert!(std::mem::size_of::<PerFrame>() == 416);
+
+/// Blend two evaluated built-in COMP uniform snapshots. `PerFrame` is a packed
+/// POD block of f32s, so this keeps new scalar controls automatically covered
+/// by the same conservative finite-value rule. It is used only after both
+/// shaderless renderer states have advanced for a shared-feedback frame.
+fn blend_comp_perframe(outgoing: &mut PerFrame, incoming: &PerFrame, progress: f32) -> bool {
+    if !progress.is_finite() {
+        return false;
+    }
+    let weight = progress.clamp(0.0, 1.0);
+    let outgoing_words: &mut [f32] =
+        bytemuck::cast_slice_mut(std::slice::from_mut(outgoing));
+    let incoming_words: &[f32] = bytemuck::cast_slice(std::slice::from_ref(incoming));
+    for (outgoing, incoming) in outgoing_words.iter_mut().zip(incoming_words) {
+        if outgoing.is_finite() && incoming.is_finite() {
+            *outgoing += (*incoming - *outgoing) * weight;
+        }
+    }
+    true
+}
+
+/// Apply a finite complementary transition weight to overlay alpha without
+/// changing the authored RGB. The existing alpha/additive blend pipelines then
+/// scale each state exactly once at draw time.
+fn weight_shape_overlay_vertices(vertices: &mut [ShapeVert], weight: f32) {
+    let weight = weight.clamp(0.0, 1.0);
+    for vertex in vertices {
+        vertex.color[3] = if vertex.color[3].is_finite() {
+            (vertex.color[3] * weight).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+    }
+}
+
+fn weight_wave_overlay_vertices(vertices: &mut [WaveVert], weight: f32) {
+    let weight = weight.clamp(0.0, 1.0);
+    for vertex in vertices {
+        vertex.color[3] = if vertex.color[3].is_finite() {
+            (vertex.color[3] * weight).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+    }
+}
 
 // ----- texture helpers -------------------------------------------------------
 
@@ -1396,6 +1588,31 @@ fn make_tex2d_with_mips(
     tex
 }
 
+/// Filterable two-row half-float texture used by the enhanced-audio helpers.
+/// This is intentionally renderer-owned rather than a named-texture-atlas slot:
+/// helpers need stable FFT/waveform rows every frame, while named textures are
+/// static preset assets with finite gutters.
+fn make_rgba16f_rows_texture(
+    device: &wgpu::Device,
+    width: u32,
+    label: &'static str,
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width,
+            height: 2,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
 /// Butterchurn's canonical blur target ratios and target-size quantization.
 /// Widths use its slightly unusual `(size + 3) / 16` floor and heights use
 /// `(size + 3) / 4`, with a 16-pixel minimum on both axes.
@@ -1413,6 +1630,83 @@ fn blur_dimensions(w: u32, h: u32) -> [(u32, u32); 6] {
         size(0.125),
         size(0.0625),
     ]
+}
+
+fn blur_min_max_remap(mut bmin: [f32; 3], mut bmax: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+    let fmin_dist = 0.1f32;
+    if bmax[0] - bmin[0] < fmin_dist {
+        let a = (bmin[0] + bmax[0]) * 0.5;
+        bmin[0] = a - fmin_dist * 0.5;
+        bmax[0] = a - fmin_dist * 0.5;
+    }
+    bmax[1] = bmax[1].min(bmax[0]);
+    bmin[1] = bmin[1].max(bmin[0]);
+    if bmax[1] - bmin[1] < fmin_dist {
+        let a = (bmin[1] + bmax[1]) * 0.5;
+        bmin[1] = a - fmin_dist * 0.5;
+        bmax[1] = a - fmin_dist * 0.5;
+    }
+    bmax[2] = bmax[2].min(bmax[1]);
+    bmin[2] = bmin[2].max(bmin[1]);
+    if bmax[2] - bmin[2] < fmin_dist {
+        let a = (bmin[2] + bmax[2]) * 0.5;
+        bmin[2] = a - fmin_dist * 0.5;
+        bmax[2] = a - fmin_dist * 0.5;
+    }
+    (bmin, bmax)
+}
+
+/// Butterchurn `getScaleAndBias`: the blur shader's normalize-into-`[0,1]` transform,
+/// derived from the post-[`blur_min_max_remap`] endpoints. Transcribed verbatim, which
+/// means it can and does produce non-finite results — see [`guard_finite_blur_scale_bias`].
+fn blur_scale_and_bias(bmin: [f32; 3], bmax: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+    let mut scale = [1.0f32; 3];
+    let mut bias = [0.0f32; 3];
+    scale[0] = 1.0 / (bmax[0] - bmin[0]);
+    bias[0] = -bmin[0] * scale[0];
+    let t_min1 = (bmin[1] - bmin[0]) / (bmax[0] - bmin[0]);
+    let t_max1 = (bmax[1] - bmin[0]) / (bmax[0] - bmin[0]);
+    scale[1] = 1.0 / (t_max1 - t_min1);
+    bias[1] = -t_min1 * scale[1];
+    let t_min2 = (bmin[2] - bmin[1]) / (bmax[1] - bmin[1]);
+    let t_max2 = (bmax[2] - bmin[1]) / (bmax[1] - bmin[1]);
+    scale[2] = 1.0 / (t_max2 - t_min2);
+    bias[2] = -t_min2 * scale[2];
+    (scale, bias)
+}
+
+/// Replace non-finite blur coefficients before GPU upload. Large finite values
+/// remain authored values; this is a safety guard, not a magnitude clamp.
+fn guard_finite_blur_scale_bias(mut scale: [f32; 3], mut bias: [f32; 3]) -> ([f32; 3], [f32; 3]) {
+    for lvl in 0..3 {
+        if !scale[lvl].is_finite() || !bias[lvl].is_finite() {
+            scale[lvl] = 1.0;
+            bias[lvl] = 0.0;
+        }
+    }
+    (scale, bias)
+}
+
+/// Keep composition-side blur coefficients finite as well as the blur pass.
+fn guard_finite_comp_blur(
+    mut bmin: [f32; 3],
+    mut bmax: [f32; 3],
+    mut scale: [f32; 3],
+    mut bias: [f32; 3],
+) -> ([f32; 3], [f32; 3], [f32; 3], [f32; 3]) {
+    for lvl in 0..3 {
+        if !bmin[lvl].is_finite()
+            || !bmax[lvl].is_finite()
+            || !scale[lvl].is_finite()
+            || !bias[lvl].is_finite()
+        {
+            bmin[lvl] = 0.0;
+            bmax[lvl] = 1.0;
+            scale[lvl] = 1.0;
+            bias[lvl] = 0.0;
+        }
+    }
+    (bmin, bmax, scale, bias)
 }
 
 fn milkdrop_angle(x: f64, y: f64, aspect_x: f64, aspect_y: f64) -> f64 {
@@ -1583,9 +1877,6 @@ fn seed_wave_base_env(env: &mut Env, wave: &CustomWaveDef) {
     }
 }
 
-/// Rejection reasons for external render dimensions, raised BEFORE any GPU
-/// allocation so a hostile preset / window size can't overflow the size math or
-/// request a multi-gigabyte texture (P2-VIS-019 + the P1-043 milkdrop slice).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DimensionError {
     /// A zero width or height was requested.
@@ -2218,7 +2509,9 @@ fn build_sampler_bg(
     noise_mq_view: &wgpu::TextureView,
     noise_hq_view: &wgpu::TextureView,
     noise_lite_view: &wgpu::TextureView,
-    named_texture_view: &wgpu::TextureView,
+    named_linear_view: &wgpu::TextureView,
+    named_point_view: &wgpu::TextureView,
+    enhanced_audio_helpers: bool,
     noisevol_lq_view: &wgpu::TextureView,
     noisevol_hq_view: &wgpu::TextureView,
     main_samp: &wgpu::Sampler,
@@ -2245,8 +2538,16 @@ fn build_sampler_bg(
             "sampler_noise_lq_lite" | "sampler_noise_hq_lite" => (noise_lite_view, repeat_samp),
             "sampler_noise_mq" => (noise_mq_view, repeat_samp),
             "sampler_noise_hq" => (noise_hq_view, repeat_samp),
-            "sampler_named_linear" => (named_texture_view, samp_clamp),
-            "sampler_named_point" => (named_texture_view, samp_point_clamp),
+            "sampler_named_linear" => (named_linear_view, samp_clamp),
+            "sampler_named_point" => (
+                named_point_view,
+                if enhanced_audio_helpers {
+                    // BeatDrop's waveform helper interpolates this row too.
+                    samp_clamp
+                } else {
+                    samp_point_clamp
+                },
+            ),
             "sampler_pw_noise_lq" => (noise_lq_view, samp_point),
             "sampler_noisevol_lq" => (noisevol_lq_view, repeat_samp),
             "sampler_noisevol_hq" => (noisevol_hq_view, repeat_samp),
@@ -2312,8 +2613,6 @@ pub fn compile_glsl(glsl: &str) -> Result<String, String> {
 
 #[derive(Clone, Debug)]
 pub struct CompiledMilkdropShaderBodies {
-    /// Always empty — the legacy fullscreen warp pipeline was removed (P2-VIS-016).
-    /// Kept only so the particle-core shader-cache byte accounting keeps compiling.
     pub warp_wgsl: String,
     pub warp_custom_wgsl: String,
     pub comp_wgsl: String,
@@ -2335,10 +2634,6 @@ pub fn compile_milkdrop_shader_bodies_from_parts(
     warp: Option<&str>,
     comp: Option<&str>,
 ) -> Result<CompiledMilkdropShaderBodies, String> {
-    // Compile warp/comp shaders. Fallback body passes through sampler_main.
-    // The live warp path is warp_custom_wgsl (the warped MESH VS). The legacy
-    // fullscreen warp FS (quad VS) is GONE (P2-VIS-016): nothing rendered it, yet
-    // its `compile_glsl` could fail and reject an otherwise-renderable preset.
     let warp_default = "ret = GetMain(uv);";
     let comp_default = "float _eh = mod(echo_orientation, 2.0); \
              float _ex = (_eh != 0.0) ? -1.0 : 1.0; \
@@ -2384,8 +2679,6 @@ pub fn compile_milkdrop_shader_bodies_from_parts(
         eprintln!("==== custom warp GLSL ====\n{warp_custom_glsl}\n==== end custom warp ====");
         eprintln!("==== comp GLSL ====\n{comp_glsl}\n==== end comp ====");
     }
-    // Only the LIVE paths are compiled. The dead legacy warp compile was removed
-    // (P2-VIS-016) so a legacy-only compile failure can no longer sink a preset.
     let warp_custom_wgsl = compile_glsl(&warp_custom_glsl)?;
     let comp_wgsl = compile_glsl(&comp_glsl)?;
     if std::env::var("MILKDROP_DUMP_WARP_WGSL").is_ok() {
@@ -2402,24 +2695,6 @@ pub fn compile_milkdrop_shader_bodies_from_parts(
     })
 }
 
-/// Whether a MilkDrop shader body samples a given blur level (1..=3).
-///
-/// Presets read blur either through the `GetBlur1/2/3` preamble helpers or by
-/// sampling `sampler_blur1/2/3` directly; both forms contain the `blurN` token.
-/// Scanning the body (not the compiled WGSL, whose preamble always declares
-/// every sampler) is the reliable signal. The per-frame `blur1_min/max` range
-/// scalars live in the EEL equations, never in a warp/comp body, so they can't
-/// false-positive here.
-///
-/// The compile path first collapses mode-prefixed samplers
-/// (`sampler_{fw,fc,pw,pc}_blurN` → `sampler_blurN`) via
-/// [`normalize_milkdrop_sampler_variants`]. A body that samples e.g.
-/// `sampler_pw_blur2` therefore compiles and reads blur2 at runtime, so the
-/// detector runs the RAW body through that SAME normalizer before matching —
-/// otherwise it would miss the prefixed spelling and skip generating a level the
-/// shader actually samples (stale/black blur texture → corruption, P2-VIS-017).
-/// Reusing the normalizer (rather than re-listing the prefixes here) means the
-/// two can't drift.
 fn milkdrop_body_samples_blur(body: &str, level: u8) -> bool {
     // Lowercase first so source-case variants (e.g. `SAMPLER_PW_BLUR2`) still hit
     // the normalizer's lowercase prefix patterns; then collapse mode prefixes.
@@ -2428,12 +2703,6 @@ fn milkdrop_body_samples_blur(body: &str, level: u8) -> bool {
     normalized.contains(&format!("getblur{n}")) || normalized.contains(&format!("sampler_blur{n}"))
 }
 
-/// Highest blur level (0..=3) that the active preset's warp/comp shaders sample.
-///
-/// The blur chain is PROGRESSIVE — blur2 is built from blur1 and blur3 from
-/// blur2 — so the renderer generates every level up to this maximum and skips the
-/// rest (P2-VIS-016 companion P2-VIS-017). A default preset (no custom warp/comp)
-/// samples no blur and returns 0 → zero blur draws.
 pub(crate) fn needed_blur_levels(warp: Option<&str>, comp: Option<&str>) -> u8 {
     let mut level = 0u8;
     for body in [warp, comp].into_iter().flatten() {
@@ -2545,6 +2814,12 @@ pub struct MilkdropRenderer {
     feedback_mips_b: Vec<wgpu::TextureView>,
     feedback_mip_blitter: wgpu::util::TextureBlitter,
     write_to_a: bool, // true → write_to_a, read from b
+    /// Legacy by default. The BeatDrop ordering is opt-in through
+    /// [`Self::set_beatdrop_feedback`].
+    feedback_provenance: FeedbackProvenance,
+    /// Per-preset BeatDrop FFT follower controls. The renderer keeps player
+    /// gain/noise-floor defaults unless a later host-level control changes them.
+    enhanced_audio_config: EnhancedAudioConfig,
 
     // blur textures and horizontal-pass intermediates.
     blur1: wgpu::Texture,
@@ -2579,6 +2854,20 @@ pub struct MilkdropRenderer {
     #[allow(dead_code)]
     named_texture_atlas: wgpu::Texture,
     view_named_texture_atlas: wgpu::TextureView,
+
+    /// Two dynamically uploaded rows used only when compiled preset code calls
+    /// an enhanced-audio helper. Keeping them separate from the named-image
+    /// atlas prevents a helper shader from accidentally sampling static art.
+    enhanced_audio_enabled: bool,
+    enhanced_fft_texture: wgpu::Texture,
+    enhanced_wave_texture: wgpu::Texture,
+    view_enhanced_fft_texture: wgpu::TextureView,
+    view_enhanced_wave_texture: wgpu::TextureView,
+    enhanced_audio_processor: EnhancedAudioProcessor,
+    enhanced_audio_fft_upload: Vec<u16>,
+    enhanced_audio_wave_upload: Vec<u16>,
+    enhanced_audio_sample_rate_hz: f32,
+    enhanced_audio_nyquist_hz: f32,
 
     // noise textures (Butterchurn-faithful; kept alive — views borrowed by bind groups)
     #[allow(dead_code)]
@@ -2619,18 +2908,21 @@ pub struct MilkdropRenderer {
     // UBO
     perframe_buf: wgpu::Buffer,
     comp_perframe_buf: wgpu::Buffer,
+    /// Most recently evaluated COMP uniform snapshot. Shared feedback blends
+    /// this with the independently advanced target before final composition.
+    last_comp_perframe: PerFrame,
 
     // blur pass uniform buffers (one per pass, holds texel size of source)
     blur1_ubo: wgpu::Buffer,
     blur2_ubo: wgpu::Buffer,
     blur3_ubo: wgpu::Buffer,
 
-    // pipelines
-    /// Custom-warp FS driven by the warped MESH VS (per-pixel warp + decay path).
-    /// This is the ONLY custom-warp pipeline — the legacy fullscreen quad-VS warp
-    /// pipeline was removed (P2-VIS-016); it was never rendered.
     warp_custom_pipeline: wgpu::RenderPipeline,
     comp_pipeline: wgpu::RenderPipeline,
+    /// Format-correct COMP path used when FXAA is disabled. `comp_pipeline`
+    /// always targets the retained Rgba8 texture; this one targets the host's
+    /// requested output format (Particle uses Rgba16Float HDR).
+    comp_direct_pipeline: wgpu::RenderPipeline,
     comp_vert_buf: wgpu::Buffer,
     comp_idx_buf: wgpu::Buffer,
     comp_idx_count: u32,
@@ -2683,6 +2975,10 @@ pub struct MilkdropRenderer {
     warp_vert_buf: wgpu::Buffer, // updated per frame
     warp_idx_buf: wgpu::Buffer,  // static
     warp_idx_count: u32,
+    /// A shared-feedback target must publish an evaluated CPU warp mesh even
+    /// when it has no per-pixel equations or motion vectors. This remains
+    /// private: it is flipped only around the target's hidden state advance.
+    force_cpu_warp_mesh: bool,
 
     // bind group layouts
     sampler_bgl: wgpu::BindGroupLayout,
@@ -2710,12 +3006,7 @@ pub struct MilkdropRenderer {
     blur2_v_bg: wgpu::BindGroup,
     blur3_h_bg: wgpu::BindGroup,
     blur3_v_bg: wgpu::BindGroup,
-    /// Highest blur level (0..=3) the active preset's shaders sample. Blur draws
-    /// above this level are skipped — a no-blur preset does zero blur passes
-    /// (P2-VIS-017). The chain is progressive, so levels 1..=blur_levels run.
     blur_levels: u8,
-    /// Blur render passes issued on the most recent `render()` (0/2/4/6) — the
-    /// observable counter the P2-VIS-017 regression test asserts on.
     last_blur_pass_count: u32,
 
     // EEL2 per-frame equations
@@ -2772,6 +3063,10 @@ pub struct MilkdropRenderer {
     /// Butterchurn-shaped 512-bin FFT magnitude array for `bSpectrum` custom
     /// waveforms. Empty when no live audio (built-in/synthetic path uses time data).
     freq_spectrum: Vec<f32>,
+    /// Optional independently derived right-channel spectrum. Legacy callers
+    /// provide only the mono row above; extended waveform mode 8 stays empty in
+    /// that case instead of pretending mono duplication is BeatDrop stereo FFT.
+    freq_spectrum_right: Vec<f32>,
     /// Optional exact Butterchurn shader random vectors for the next frame. This
     /// is chiefly useful to make an offline parity capture independent of each
     /// renderer's internal PRNG implementation.
@@ -2953,8 +3248,6 @@ impl MilkdropRenderer {
         pipeline_cache: Option<&wgpu::PipelineCache>,
     ) -> Result<Self, String> {
         let (w, h) = (width.max(1), height.max(1));
-        // Reject overflowing / over-limit dimensions BEFORE allocating any texture
-        // or CPU seed buffer (P2-VIS-019 + P1-043 milkdrop slice).
         validate_texture_dims(device.limits().max_texture_dimension_2d, w, h)
             .map_err(|e| e.to_string())?;
 
@@ -2963,6 +3256,28 @@ impl MilkdropRenderer {
         let blur_levels = needed_blur_levels(shaders.warp.as_deref(), shaders.comp.as_deref());
         let warp_custom_wgsl = compiled.warp_custom_wgsl.as_str();
         let comp_wgsl = compiled.comp_wgsl.as_str();
+        let enhanced_audio_enabled = shaders
+            .warp
+            .as_deref()
+            .is_some_and(uses_enhanced_audio_helpers)
+            || shaders
+                .comp
+                .as_deref()
+                .is_some_and(uses_enhanced_audio_helpers);
+        let has_named_texture_calls = [shaders.warp.as_deref(), shaders.comp.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|source| !custom_sampler_names(source).is_empty());
+        // Both feature families intentionally share the two fixed named sampler
+        // bindings emitted by preprocessing. A mixed shader would silently bind
+        // either the dynamic audio rows or the image atlas to both calls, so fail
+        // construction with an actionable diagnostic rather than render lies.
+        if enhanced_audio_enabled && has_named_texture_calls {
+            return Err(
+                "enhanced-audio helpers cannot be combined with named texture calls in one preset yet"
+                    .into(),
+            );
+        }
 
         // Butterchurn starts both feedback surfaces black. Authored waves/shapes
         // seed the feedback naturally; injecting lattice noise here creates false
@@ -3060,6 +3375,43 @@ impl MilkdropRenderer {
             Some(&named_pixels),
         );
         let view_named_texture_atlas = named_texture_atlas.create_view(&Default::default());
+        let enhanced_fft_texture =
+            make_rgba16f_rows_texture(&device, ENHANCED_FFT_BINS as u32, "enhanced-audio-fft");
+        let enhanced_wave_texture = make_rgba16f_rows_texture(
+            &device,
+            ENHANCED_WAVE_SAMPLES as u32,
+            "enhanced-audio-waveform",
+        );
+        let view_enhanced_fft_texture = enhanced_fft_texture.create_view(&Default::default());
+        let view_enhanced_wave_texture = enhanced_wave_texture.create_view(&Default::default());
+        let enhanced_audio_fft_upload = vec![0u16; ENHANCED_FFT_BINS * 2 * 4];
+        let enhanced_audio_wave_upload = vec![0u16; ENHANCED_WAVE_SAMPLES * 2 * 4];
+        let upload_enhanced_rows = |texture: &wgpu::Texture, rows: &[u16], width: u32| {
+            queue.write_texture(
+                texture.as_image_copy(),
+                bytemuck::cast_slice(rows),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * 8),
+                    rows_per_image: Some(2),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height: 2,
+                    depth_or_array_layers: 1,
+                },
+            );
+        };
+        upload_enhanced_rows(
+            &enhanced_fft_texture,
+            &enhanced_audio_fft_upload,
+            ENHANCED_FFT_BINS as u32,
+        );
+        upload_enhanced_rows(
+            &enhanced_wave_texture,
+            &enhanced_audio_wave_upload,
+            ENHANCED_WAVE_SAMPLES as u32,
+        );
 
         // Noise textures — Butterchurn-faithful value/lattice noise (noise.js).
         // LQ 256² zoom1 (random), MQ 256² zoom4 (smoothed), HQ 256² zoom8 (smoothed),
@@ -3400,32 +3752,41 @@ impl MilkdropRenderer {
             label: Some("comp-fs"),
             source: wgpu::ShaderSource::Wgsl(comp_wgsl.into()),
         });
-        let comp_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("comp-pipeline"),
-            layout: Some(&comp_pl),
-            vertex: wgpu::VertexState {
-                module: &comp_mesh_mod,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[comp_vbl],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &comp_mod,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    // COMP now writes the offscreen Rgba8Unorm target (FXAA reads it).
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: pipeline_cache,
-        });
+        let make_comp_pipeline = |label: &'static str, format: wgpu::TextureFormat| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&comp_pl),
+                vertex: wgpu::VertexState {
+                    module: &comp_mesh_mod,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[comp_vbl.clone()],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &comp_mod,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: pipeline_cache,
+            })
+        };
+        // The retained COMP texture is Rgba8Unorm. When FXAA is off, COMP
+        // writes directly to `surface_format`, which may instead be HDR.
+        let comp_pipeline = make_comp_pipeline("comp-pipeline", wgpu::TextureFormat::Rgba8Unorm);
+        let comp_direct_pipeline = if surface_format == wgpu::TextureFormat::Rgba8Unorm {
+            comp_pipeline.clone()
+        } else {
+            make_comp_pipeline("comp-direct-pipeline", surface_format)
+        };
 
         // Blur pipeline
         let blur_src = include_str!("shaders/blur.wgsl");
@@ -3546,7 +3907,14 @@ impl MilkdropRenderer {
             }],
         });
 
-        // Sampler bind groups (two, one per ping-pong side)
+        // Sampler bind groups (two, one per ping-pong side). Enhanced helpers
+        // own the two fixed named sampler slots; normal presets retain the
+        // static named-image atlas in both slots.
+        let (named_linear_view, named_point_view) = if enhanced_audio_enabled {
+            (&view_enhanced_fft_texture, &view_enhanced_wave_texture)
+        } else {
+            (&view_named_texture_atlas, &view_named_texture_atlas)
+        };
         let bg_read_a = build_sampler_bg(
             &device,
             &sampler_bgl,
@@ -3559,7 +3927,9 @@ impl MilkdropRenderer {
             &view_noise_mq,
             &view_noise_hq,
             &view_noise_lite,
-            &view_named_texture_atlas,
+            named_linear_view,
+            named_point_view,
+            enhanced_audio_enabled,
             &view_noisevol_lq,
             &view_noisevol_hq,
             &linear_samp,
@@ -3580,7 +3950,9 @@ impl MilkdropRenderer {
             &view_noise_mq,
             &view_noise_hq,
             &view_noise_lite,
-            &view_named_texture_atlas,
+            named_linear_view,
+            named_point_view,
+            enhanced_audio_enabled,
             &view_noisevol_lq,
             &view_noisevol_hq,
             &linear_samp,
@@ -3601,7 +3973,9 @@ impl MilkdropRenderer {
             &view_noise_mq,
             &view_noise_hq,
             &view_noise_lite,
-            &view_named_texture_atlas,
+            named_linear_view,
+            named_point_view,
+            enhanced_audio_enabled,
             &view_noisevol_lq,
             &view_noisevol_hq,
             &clamp_samp,
@@ -3622,7 +3996,9 @@ impl MilkdropRenderer {
             &view_noise_mq,
             &view_noise_hq,
             &view_noise_lite,
-            &view_named_texture_atlas,
+            named_linear_view,
+            named_point_view,
+            enhanced_audio_enabled,
             &view_noisevol_lq,
             &view_noisevol_hq,
             &clamp_samp,
@@ -3830,10 +4206,6 @@ impl MilkdropRenderer {
         // ── Custom-shape pipelines/buffers ───────────────────────────────────
         let shape_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shape-bgl"),
-            // Only the prev-frame texture + sampler for textured shapes. The former
-            // ShapeU `textured` uniform (binding 2) was removed (P2-VIS-032): no
-            // shader read it — the textured flag is baked into a negative-UV vertex
-            // sentinel in shapes.wgsl instead.
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -4682,6 +5054,12 @@ impl MilkdropRenderer {
             feedback_mips_b,
             feedback_mip_blitter,
             write_to_a: true,
+            feedback_provenance: if shaders.beatdrop_feedback {
+                FeedbackProvenance::Beatdrop
+            } else {
+                FeedbackProvenance::Legacy
+            },
+            enhanced_audio_config: shaders.enhanced_audio.sanitized(),
             blur1,
             blur2,
             blur3,
@@ -4708,6 +5086,16 @@ impl MilkdropRenderer {
             btemp_mips3,
             named_texture_atlas,
             view_named_texture_atlas,
+            enhanced_audio_enabled,
+            enhanced_fft_texture,
+            enhanced_wave_texture,
+            view_enhanced_fft_texture,
+            view_enhanced_wave_texture,
+            enhanced_audio_processor: EnhancedAudioProcessor::new(),
+            enhanced_audio_fft_upload,
+            enhanced_audio_wave_upload,
+            enhanced_audio_sample_rate_hz: LEGACY_ASSUMED_SAMPLE_RATE_HZ,
+            enhanced_audio_nyquist_hz: LEGACY_ASSUMED_SAMPLE_RATE_HZ * 0.5,
             noise2d,
             noise_lq,
             noise_mq,
@@ -4728,11 +5116,13 @@ impl MilkdropRenderer {
             point_clamp_samp,
             perframe_buf,
             comp_perframe_buf,
+            last_comp_perframe: bytemuck::Zeroable::zeroed(),
             blur1_ubo,
             blur2_ubo,
             blur3_ubo,
             warp_custom_pipeline,
             comp_pipeline,
+            comp_direct_pipeline,
             comp_vert_buf,
             comp_idx_buf,
             comp_idx_count,
@@ -4765,6 +5155,7 @@ impl MilkdropRenderer {
             warp_vert_buf,
             warp_idx_buf,
             warp_idx_count,
+            force_cpu_warp_mesh: false,
             sampler_bgl,
             perframe_bgl,
             blur_bgl,
@@ -4809,6 +5200,8 @@ impl MilkdropRenderer {
                 shape_border_draws: Vec::new(),
                 wave_verts: Vec::new(),
                 wave_draws: Vec::new(),
+                shared_shape_fill_verts: Vec::new(),
+                shared_wave_verts: Vec::new(),
                 frame_border_verts: Vec::with_capacity(48),
                 frame_border_draws: Vec::with_capacity(2),
                 border_uniform_bytes: Vec::new(),
@@ -4824,6 +5217,7 @@ impl MilkdropRenderer {
             audio: None,
             audio_att: None,
             freq_spectrum: Vec::new(),
+            freq_spectrum_right: Vec::new(),
             frame_random_override: None,
             frame_time_override: None,
             width: w,
@@ -4948,6 +5342,251 @@ impl MilkdropRenderer {
         (self.width, self.height)
     }
 
+    /// Opt in to BeatDrop-style feedback provenance for this renderer.
+    ///
+    /// `false` is the default and is byte-for-byte the established OjoDrop
+    /// ordering. This setter deliberately controls provenance only; native
+    /// two-state morphing is requested separately through
+    /// [`Self::render_shared_feedback`] by the runtime that owns both states.
+    pub fn set_beatdrop_feedback(&mut self, enabled: bool) {
+        self.feedback_provenance = if enabled {
+            FeedbackProvenance::Beatdrop
+        } else {
+            FeedbackProvenance::Legacy
+        };
+    }
+
+    /// Current feedback provenance selection.
+    pub fn feedback_provenance(&self) -> FeedbackProvenance {
+        self.feedback_provenance
+    }
+
+    /// Update the preset-scoped BeatDrop FFT follower controls without touching
+    /// player-level gain/noise-floor defaults. Runtime base-value updates call
+    /// this alongside [`Self::set_beatdrop_feedback`].
+    pub fn set_enhanced_audio_config(&mut self, config: EnhancedAudioConfig) {
+        let sanitized = config.sanitized();
+        self.enhanced_audio_config.fft_attack = sanitized.fft_attack;
+        self.enhanced_audio_config.fft_decay = sanitized.fft_decay;
+    }
+
+    /// Current effective enhanced-audio configuration. `fft_scaling` and
+    /// `fft_noise_floor` remain renderer/player defaults unless explicitly
+    /// changed by a future host control.
+    pub fn enhanced_audio_config(&self) -> EnhancedAudioConfig {
+        self.enhanced_audio_config
+    }
+
+    /// Whether every authored overlay can be drawn into the shared post-warp
+    /// pass with a single complementary-opacity weight. Waves and static,
+    /// untextured, borderless shapes meet that contract. Textured/dynamic shapes
+    /// sample a renderer-local feedback page, while vectors/darken/frame-borders
+    /// have ordering or uniform requirements that need a dedicated overlay
+    /// target; keep those on the caller's ordinary fallback for now.
+    fn shared_feedback_overlays_are_supported(&self) -> bool {
+        if self.mv_on
+            || self.darken_center
+            || self.ob_a != 0.0
+            || self.ib_a != 0.0
+        {
+            return false;
+        }
+        self.shapes.iter().all(|shape| {
+            shape.base.enabled == 0
+                || (shape.prog.is_none()
+                    && shape.base.textured == 0
+                    && shape.base.border_a <= 0.0)
+        })
+    }
+
+    fn shared_feedback_has_supported_overlays(&self) -> bool {
+        self.bw_a != 0.0
+            || !self.waves.is_empty()
+            || self.shapes.iter().any(|shape| shape.base.enabled != 0)
+    }
+
+    /// Built-in COMP controls are interpolated from their evaluated UBOs and
+    /// waves are converted to weighted vertex colors after their frame equations
+    /// run. Controls that branch in COMP or could emit an unsupported overlay
+    /// are rejected instead of being fractionally blended.
+    fn shared_feedback_per_frame_avoids_unsupported_overlays(&self) -> bool {
+        const UNSUPPORTED_SYMBOLS: &[&str] = &[
+            "b1n",
+            "b1x",
+            "b1ed",
+            "b2n",
+            "b2x",
+            "b3n",
+            "b3x",
+            "mv_x",
+            "mv_y",
+            "mv_dx",
+            "mv_dy",
+            "mv_l",
+            "mv_r",
+            "mv_g",
+            "mv_b",
+            "mv_a",
+            "ob_size",
+            "ob_r",
+            "ob_g",
+            "ob_b",
+            "ob_a",
+            "ib_size",
+            "ib_r",
+            "ib_g",
+            "ib_b",
+            "ib_a",
+            "darken_center",
+            "fshader",
+            "echo_orient",
+            "brighten",
+            "darken",
+            "solarize",
+            "invert",
+        ];
+        self.eel_program.as_ref().map_or(true, |program| {
+            !UNSUPPORTED_SYMBOLS
+                .iter()
+                .any(|symbol| program.references_symbol(symbol))
+        })
+    }
+
+    /// These controls branch in the default COMP shader. Keeping both endpoints
+    /// identical avoids the false middle state produced by raw UBO interpolation;
+    /// hue shader is simply outside this bounded path because its mesh colors
+    /// are renderer-local `rand_start` products.
+    fn shared_feedback_discrete_comp_matches(&self, other: &Self) -> bool {
+        self.comp_fshader.is_finite()
+            && other.comp_fshader.is_finite()
+            && self.comp_fshader.abs() <= 0.001
+            && other.comp_fshader.abs() <= 0.001
+            && self.echo_orient.is_finite()
+            && other.echo_orient.is_finite()
+            && self.echo_orient == other.echo_orient
+            && self.comp_brighten == other.comp_brighten
+            && self.comp_darken == other.comp_darken
+            && self.comp_solarize == other.comp_solarize
+            && self.comp_invert == other.comp_invert
+    }
+
+    /// Report whether this exact pair can use the bounded native
+    /// shared-feedback path. The caller must retain its ordinary transition for
+    /// every non-supported result; this does not claim arbitrary shader-pair
+    /// parity.
+    pub fn shared_feedback_support(&self, other: &Self) -> SharedFeedbackSupport {
+        if std::ptr::eq(self, other) {
+            return SharedFeedbackSupport::SameRenderer;
+        }
+        if self.device.as_ref() != other.device.as_ref() {
+            return SharedFeedbackSupport::DifferentDevice;
+        }
+        if self.surface_format != other.surface_format {
+            return SharedFeedbackSupport::DifferentSurfaceFormat;
+        }
+        if (self.width, self.height, self.render_w, self.render_h)
+            != (other.width, other.height, other.render_w, other.render_h)
+        {
+            return SharedFeedbackSupport::DifferentDimensions;
+        }
+        if self.has_custom_warp
+            || self.has_custom_comp
+            || other.has_custom_warp
+            || other.has_custom_comp
+        {
+            return SharedFeedbackSupport::CustomShadersUnsupported;
+        }
+        if !self.shared_feedback_overlays_are_supported()
+            || !other.shared_feedback_overlays_are_supported()
+        {
+            return SharedFeedbackSupport::VisibleOverlaysUnsupported;
+        }
+        if !self.shared_feedback_per_frame_avoids_unsupported_overlays()
+            || !other.shared_feedback_per_frame_avoids_unsupported_overlays()
+        {
+            return SharedFeedbackSupport::PerFrameCompOrOverlayUnsupported;
+        }
+        if !self.shared_feedback_discrete_comp_matches(other) {
+            return SharedFeedbackSupport::DiscreteCompUnsupported;
+        }
+        if self.shared_feedback_has_supported_overlays()
+            || other.shared_feedback_has_supported_overlays()
+        {
+            SharedFeedbackSupport::UntexturedOverlaysInterpolatedComp
+        } else {
+            SharedFeedbackSupport::FeedbackOnlyInterpolatedComp
+        }
+    }
+
+    /// Boolean shorthand for [`Self::shared_feedback_support`].
+    pub fn supports_shared_feedback(&self, other: &Self) -> bool {
+        self.shared_feedback_support(other).is_supported()
+    }
+
+    /// Copy both ping-pong feedback pages from `other`, preserving its current
+    /// write side. This lets a newly prepared renderer enter a native morph with
+    /// a single history, and lets the runtime promote the current target during
+    /// an interrupted morph without a feedback reset.
+    ///
+    /// The operation is intentionally limited to already compatible renderer
+    /// pairs. It returns `false` without encoding work when dimensions, device,
+    /// or format differ.
+    pub fn seed_feedback_from(&mut self, other: &Self) -> bool {
+        if std::ptr::eq(self, other)
+            || self.device.as_ref() != other.device.as_ref()
+            || self.surface_format != other.surface_format
+            || (self.width, self.height, self.render_w, self.render_h)
+                != (other.width, other.height, other.render_w, other.render_h)
+        {
+            return false;
+        }
+
+        let extent = wgpu::Extent3d {
+            width: self.render_w,
+            height: self.render_h,
+            depth_or_array_layers: 1,
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("milkdrop-shared-feedback-seed"),
+            });
+        encoder.copy_texture_to_texture(other.tex_a.as_image_copy(), self.tex_a.as_image_copy(), extent);
+        encoder.copy_texture_to_texture(other.tex_b.as_image_copy(), self.tex_b.as_image_copy(), extent);
+        generate_mip_chain(
+            &self.device,
+            &self.feedback_mip_blitter,
+            &mut encoder,
+            &self.feedback_mips_a,
+        );
+        generate_mip_chain(
+            &self.device,
+            &self.feedback_mip_blitter,
+            &mut encoder,
+            &self.feedback_mips_b,
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+        self.write_to_a = other.write_to_a;
+        true
+    }
+
+    /// Copy frame-varying host inputs into an incoming state before its hidden
+    /// equation advance. Preset state (EEL environments, RNG, shape/wave pools)
+    /// remains independent; only the clock and audio source are shared.
+    fn mirror_shared_feedback_inputs_from(&mut self, outgoing: &Self) {
+        self.start = outgoing.start;
+        self.frame_idx = outgoing.frame_idx;
+        self.time_per_frame = outgoing.time_per_frame;
+        self.frame_time_override = outgoing.frame_time_override;
+        self.audio = outgoing.audio;
+        self.audio_att = outgoing.audio_att;
+        self.wave_l.clone_from(&outgoing.wave_l);
+        self.wave_r.clone_from(&outgoing.wave_r);
+        self.freq_spectrum.clone_from(&outgoing.freq_spectrum);
+        self.freq_spectrum_right
+            .clone_from(&outgoing.freq_spectrum_right);
+    }
+
     /// Replace live numeric/bool base values without rebuilding renderer-owned
     /// programs, equation state, buffers, or feedback textures.
     pub fn apply_base_vals(&mut self, values: &MilkBaseVals) {
@@ -5033,8 +5672,6 @@ impl MilkdropRenderer {
     /// overlapping region of the previous feedback is copied into them before
     /// mip generation.
     pub fn resize(&mut self, width: u32, height: u32) {
-        // Decline (keep the current size) rather than panic/allocate when the new
-        // size is over-limit or overflows the size math (P2-VIS-019).
         if let Err(e) = self.try_resize(width, height) {
             log::warn!("milkdrop resize to {width}x{height} rejected: {e}");
         }
@@ -5219,6 +5856,17 @@ impl MilkdropRenderer {
             bytemuck::cast_slice(&[w as f32, h as f32, 1.0 / w as f32, 1.0 / h as f32]),
         );
 
+        let (named_linear_view, named_point_view) = if self.enhanced_audio_enabled {
+            (
+                &self.view_enhanced_fft_texture,
+                &self.view_enhanced_wave_texture,
+            )
+        } else {
+            (
+                &self.view_named_texture_atlas,
+                &self.view_named_texture_atlas,
+            )
+        };
         let bg_read_a = build_sampler_bg(
             &device,
             &self.sampler_bgl,
@@ -5231,7 +5879,9 @@ impl MilkdropRenderer {
             &self.view_noise_mq,
             &self.view_noise_hq,
             &self.view_noise_lite,
-            &self.view_named_texture_atlas,
+            named_linear_view,
+            named_point_view,
+            self.enhanced_audio_enabled,
             &self.view_noisevol_lq,
             &self.view_noisevol_hq,
             &self.linear_samp,
@@ -5252,7 +5902,9 @@ impl MilkdropRenderer {
             &self.view_noise_mq,
             &self.view_noise_hq,
             &self.view_noise_lite,
-            &self.view_named_texture_atlas,
+            named_linear_view,
+            named_point_view,
+            self.enhanced_audio_enabled,
             &self.view_noisevol_lq,
             &self.view_noisevol_hq,
             &self.linear_samp,
@@ -5273,7 +5925,9 @@ impl MilkdropRenderer {
             &self.view_noise_mq,
             &self.view_noise_hq,
             &self.view_noise_lite,
-            &self.view_named_texture_atlas,
+            named_linear_view,
+            named_point_view,
+            self.enhanced_audio_enabled,
             &self.view_noisevol_lq,
             &self.view_noisevol_hq,
             &self.clamp_samp,
@@ -5294,7 +5948,9 @@ impl MilkdropRenderer {
             &self.view_noise_mq,
             &self.view_noise_hq,
             &self.view_noise_lite,
-            &self.view_named_texture_atlas,
+            named_linear_view,
+            named_point_view,
+            self.enhanced_audio_enabled,
             &self.view_noisevol_lq,
             &self.view_noisevol_hq,
             &self.clamp_samp,
@@ -5459,8 +6115,6 @@ impl MilkdropRenderer {
         Ok(())
     }
 
-    /// Highest blur level (0..=3) the active preset's shaders sample. Blur levels
-    /// above this are skipped every frame (P2-VIS-017).
     pub fn blur_levels(&self) -> u8 {
         self.blur_levels
     }
@@ -5606,19 +6260,150 @@ impl MilkdropRenderer {
             .read_images(&self.device)
     }
 
-    /// Feed live audio reactivity for the next frame. Values are MilkDrop-style
-    /// band levels (~1.0 = average energy, 0 = silent, >1 = loud). Once set, the
-    /// synthetic sine-wave fallback is disabled.
     pub fn set_audio(&mut self, bass: f32, mid: f32, treb: f32, vol: f32) {
-        self.audio = Some([bass, mid, treb, vol]);
+        self.audio = Some([
+            audio_level_floor(bass),
+            audio_level_floor(mid),
+            audio_level_floor(treb),
+            audio_level_floor(vol),
+        ]);
     }
 
-    /// Feed the attenuated (smoothed) reactivity envelopes for the next frame —
-    /// the MilkDrop `bass_att`/`mid_att`/`treb_att`/`vol_att` inputs. These lag
-    /// peaks relative to [`set_audio`]. If never called, `*_att` mirrors the
-    /// non-att values (preserving the prior headless behavior bit-for-bit).
     pub fn set_audio_att(&mut self, bass_att: f32, mid_att: f32, treb_att: f32, vol_att: f32) {
-        self.audio_att = Some([bass_att, mid_att, treb_att, vol_att]);
+        self.audio_att = Some([
+            audio_att_floor(bass_att),
+            audio_att_floor(mid_att),
+            audio_att_floor(treb_att),
+            audio_att_floor(vol_att),
+        ]);
+    }
+
+    /// Set the metadata rate used by Hz-addressed enhanced-audio helpers.
+    ///
+    /// This is intentionally separate from the legacy `AudioInput` layout:
+    /// recordings/preanalysis do not carry this side channel and therefore keep
+    /// the documented 44.1 kHz fallback. Live hosts should call it whenever the
+    /// capture device sample rate changes.
+    pub fn set_enhanced_audio_sample_rate(&mut self, sample_rate_hz: f32) {
+        self.enhanced_audio_sample_rate_hz = if sample_rate_hz.is_finite()
+            && (2.0..=384_000.0).contains(&sample_rate_hz)
+        {
+            sample_rate_hz
+        } else {
+            LEGACY_ASSUMED_SAMPLE_RATE_HZ
+        };
+        self.enhanced_audio_nyquist_hz = self.enhanced_audio_sample_rate_hz * 0.5;
+    }
+
+    /// Update the renderer-owned BeatDrop-style FFT and waveform textures.
+    ///
+    /// Independent L/R magnitudes are accepted when the host truly has them;
+    /// otherwise this runs the bounded 2,048-sample PCM FFT path. Supplying the
+    /// legacy mono/equalized `freqArray` twice is intentionally not treated as
+    /// a stereo spectrum. Work and GPU upload are skipped unless the compiled
+    /// preset actually calls an enhanced-audio shader helper, except that a
+    /// base mode-8 waveform needs this bounded calculation to obtain its real
+    /// independent spectrum rows. (Dynamic per-frame changes into mode 8 should
+    /// use [`Self::set_stereo_freq_spectrum`] until the next preset load.)
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_enhanced_audio(
+        &mut self,
+        spectrum_left: Option<&[f32]>,
+        spectrum_right: Option<&[f32]>,
+        waveform_left: &[f32],
+        waveform_right: &[f32],
+        effective_sample_rate_hz: f32,
+        elapsed_seconds: f32,
+        config: EnhancedAudioConfig,
+    ) {
+        self.set_enhanced_audio_config(config);
+        self.set_enhanced_audio_sample_rate(effective_sample_rate_hz);
+        let base_mode_is_stereo_spectrum = self.bw_mode.is_finite()
+            && (self.bw_mode.floor() as i32).rem_euclid(18) == 8;
+        if !self.enhanced_audio_enabled && !base_mode_is_stereo_spectrum {
+            return;
+        }
+
+        let config = self.enhanced_audio_config;
+        let sample_rate_hz = self.enhanced_audio_sample_rate_hz;
+        let nyquist_hz = {
+            let (processor, fft_upload, wave_upload, freq_left, freq_right) = (
+                &mut self.enhanced_audio_processor,
+                &mut self.enhanced_audio_fft_upload,
+                &mut self.enhanced_audio_wave_upload,
+                &mut self.freq_spectrum,
+                &mut self.freq_spectrum_right,
+            );
+            let frame = match (
+                spectrum_left.filter(|row| !row.is_empty()),
+                spectrum_right.filter(|row| !row.is_empty()),
+            ) {
+                (Some(left), Some(right)) => processor.update_stereo_spectrum(
+                    left,
+                    right,
+                    waveform_left,
+                    waveform_right,
+                    sample_rate_hz,
+                    elapsed_seconds,
+                    config,
+                ),
+                _ => processor.update_from_pcm(
+                    waveform_left,
+                    waveform_right,
+                    sample_rate_hz,
+                    elapsed_seconds,
+                    config,
+                ),
+            };
+            frame.write_fft_rgba16f(fft_upload);
+            frame.write_waveform_rgba16f(wave_upload);
+            // These raw, finite L/R rows are intentionally separate from
+            // `fft_rows`, whose rows are the helper's AGC-smoothed and
+            // peak-hold values. Mode 8 uses adjacent bins from the real input
+            // channels, so copying the latter would change its geometry.
+            match frame.spectrum_rows() {
+                Some((left, right)) => {
+                    let left_len = left.len().min(MAX_AUDIO_SAMPLES);
+                    let right_len = right.len().min(MAX_AUDIO_SAMPLES);
+                    replace_audio_samples(freq_left, &left[..left_len], left_len, false);
+                    replace_audio_samples(freq_right, &right[..right_len], right_len, false);
+                }
+                None => freq_right.clear(),
+            }
+            frame.nyquist_hz()
+        };
+        self.enhanced_audio_nyquist_hz = nyquist_hz;
+
+        if !self.enhanced_audio_enabled {
+            return;
+        }
+
+        let upload_rows = |texture: &wgpu::Texture, rows: &[u16], width: u32| {
+            self.queue.write_texture(
+                texture.as_image_copy(),
+                bytemuck::cast_slice(rows),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * 8),
+                    rows_per_image: Some(2),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height: 2,
+                    depth_or_array_layers: 1,
+                },
+            );
+        };
+        upload_rows(
+            &self.enhanced_fft_texture,
+            &self.enhanced_audio_fft_upload,
+            ENHANCED_FFT_BINS as u32,
+        );
+        upload_rows(
+            &self.enhanced_wave_texture,
+            &self.enhanced_audio_wave_upload,
+            ENHANCED_WAVE_SAMPLES as u32,
+        );
     }
 
     /// Override this frame's warp and comp `rand_frame` uniforms with values
@@ -5670,6 +6455,26 @@ impl MilkdropRenderer {
             &mut self.freq_spectrum,
             spectrum,
             sample_count.min(MAX_AUDIO_SAMPLES),
+            false,
+        );
+        // The legacy ingress has one equalized/mono magnitude row. Do not
+        // silently duplicate it as a false stereo source for BeatDrop mode 8.
+        self.freq_spectrum_right.clear();
+    }
+
+    /// Feed independently-derived left and right spectrum rows. This optional
+    /// ingress is specifically for the extended BeatDrop mode-8 waveform;
+    /// ordinary custom `bSpectrum` waves continue to read the left/legacy row.
+    /// Supplying either empty row disables mode 8 for that frame rather than
+    /// presenting a mono approximation as stereo-compatible output.
+    pub fn set_stereo_freq_spectrum(&mut self, left: &[f32], right: &[f32]) {
+        let left_len = left.len().min(MAX_AUDIO_SAMPLES);
+        let right_len = right.len().min(MAX_AUDIO_SAMPLES);
+        replace_audio_samples(&mut self.freq_spectrum, &left[..left_len], left_len, false);
+        replace_audio_samples(
+            &mut self.freq_spectrum_right,
+            &right[..right_len],
+            right_len,
             false,
         );
     }
@@ -5760,11 +6565,6 @@ impl MilkdropRenderer {
             let num_inst = (s.base.num_inst.max(1)).min(MAX_SHAPE_INSTANCES as i32);
 
             for j in 0..num_inst {
-                // Bound CPU geometry (and the fixed-size vertex buffer it fills) to
-                // its capacity BEFORE doing any per-instance EEL/geometry work. An
-                // absurd `num_inst`/`sides` therefore can't generate more shape verts
-                // than the permanent buffer can hold (P2-VIS-018). SHAPE_FILL_VERTS_MAX
-                // is the worst-case per-instance cost (SIDES_MAX + 2).
                 if fill_verts.len() + SHAPE_FILL_VERTS_MAX > SHAPE_VERT_CAP {
                     break;
                 }
@@ -5920,9 +6720,6 @@ impl MilkdropRenderer {
                 let border_g = fin(border_g, 0.0).clamp(0.0, 1.0);
                 let border_b = fin(border_b, 0.0).clamp(0.0, 1.0);
                 let border_alpha = fin(border_a, 0.0).clamp(0.0, 1.0) * blend_progress;
-                // Also bound the border vertex buffer: drop the rim when it would
-                // overflow BORDER_VERT_CAP rather than generating verts we can't
-                // upload (P2-VIS-018). Rim cost is (sides + 1) verts.
                 let has_border = border_alpha > 0.0
                     && border_verts.len() + (sides as usize + 1) <= BORDER_VERT_CAP;
                 let quarter_pi = PI * 0.25;
@@ -6076,6 +6873,7 @@ impl MilkdropRenderer {
                 live_wave_a,
                 wave_l,
                 wave_r,
+                freq,
                 &mut verts,
                 &mut draws,
                 &mut basic_scratch,
@@ -6098,6 +6896,7 @@ impl MilkdropRenderer {
         live_wave_a: f32,
         time_l: &[f32],
         time_r: &[f32],
+        spectrum_left: &[f32],
         verts: &mut Vec<WaveVert>,
         draws: &mut Vec<WaveDraw>,
         scratch: &mut BasicWaveScratch,
@@ -6155,9 +6954,83 @@ impl MilkdropRenderer {
         let wave_l = scratch.processed_l.as_slice();
         let wave_r = scratch.processed_r.as_slice();
 
-        let new_wave_mode = (live_wave_mode.floor() as i32).rem_euclid(8);
+        // BeatDrop extends the classic 0..=7 set through mode 17. Preserve the
+        // classic match below byte-for-byte for modes 0..=7; modes 8..=17 are
+        // isolated in the licensed helper and share only this renderer-owned
+        // color/smoothing/upload tail.
+        let new_wave_mode = (live_wave_mode.floor() as i32).rem_euclid(18);
         let wave_pos_x = live_wave_x * 2.0 - 1.0;
         let wave_pos_y = live_wave_y * 2.0 - 1.0;
+
+        if new_wave_mode >= 8 {
+            // Mode 8 remains empty unless an ingress supplied real independent
+            // L/R magnitudes. `set_enhanced_audio` installs the processor's raw
+            // host/PCM rows here when active; `set_stereo_freq_spectrum` is the
+            // direct alternative. Legacy mono spectrum input never fills right.
+            let Some(geometry) = build_extended_waveform(ExtendedWaveformInput {
+                mode: new_wave_mode,
+                time: t,
+                wave_pos_x,
+                wave_pos_y,
+                wave_param: live_wave_mystery,
+                aspect_x: aspectx,
+                aspect_y: aspecty,
+                screen_dependent: false,
+                render_width: self.render_w as usize,
+                left: wave_l,
+                right: wave_r,
+                spectrum_left,
+                spectrum_right: &self.freq_spectrum_right,
+                bass: bass as f32,
+                mid: mid as f32,
+                treble: treb as f32,
+                alpha: base_alpha,
+                modulate_alpha_by_volume: live_modalphavol,
+                modwave_alpha_start: live_modalphastart,
+                modwave_alpha_end: live_modalphaend,
+                blending: live_additive,
+            }) else {
+                return;
+            };
+
+            let mut cr = live("wave_r", self.bw_r).clamp(0.0, 1.0);
+            let mut cg = live("wave_g", self.bw_g).clamp(0.0, 1.0);
+            let mut cb = live("wave_b", self.bw_b).clamp(0.0, 1.0);
+            if live_brighten {
+                let maxc = cr.max(cg).max(cb);
+                if maxc > 0.01 {
+                    cr /= maxc;
+                    cg /= maxc;
+                    cb /= maxc;
+                }
+            }
+            if geometry.alpha <= 0.0 {
+                return;
+            }
+            let color = [cr, cg, cb, geometry.alpha];
+            let points = live_dots || geometry.points_recommended;
+            let thick = live_thick || live_dots;
+            let smoothed = &mut scratch.smoothed;
+            for mut strip in geometry.strips {
+                for position in &mut strip {
+                    position[1] = -position[1];
+                }
+                smooth_wave_into(&strip, smoothed);
+                if smoothed.is_empty() {
+                    continue;
+                }
+                let start = verts.len() as u32;
+                verts.extend(smoothed.iter().copied().map(|pos| WaveVert { pos, color }));
+                draws.push(WaveDraw {
+                    start_vert: start,
+                    count: smoothed.len() as u32,
+                    points,
+                    additive: live_additive,
+                    thick,
+                });
+            }
+            return;
+        }
 
         let mut param2 = live_wave_mystery;
         if (new_wave_mode == 0 || new_wave_mode == 1 || new_wave_mode == 4) && param2.abs() > 1.0 {
@@ -6639,15 +7512,6 @@ impl MilkdropRenderer {
             // *128 on the time branch only.
             let scale =
                 (if pf_spectrum { 0.15 } else { 0.004 * 128.0 }) * pf_scaling * wave_scale_base;
-            // bSpectrum waveforms read the FFT freqArray (butterchurn customWaveform.js:
-            // pointsLeft = useSpectrum ? freqArrayL : timeArrayL). Our freq array is still
-            // mono, but honor sep as an offset into that spectrum so value1/value2 do not
-            // collapse to the same bin. The FFT and PCM arrays are resampled to
-            // `max_samples` INDEPENDENTLY: a spectrum wave uses the (resampled) FFT even
-            // when its length differs from the PCM length — no time-domain fallback on a
-            // mere length mismatch (P2-VIS-031). Time data is used only with no live FFT.
-            // Reuse persistent source buffers only when a row truly needs
-            // resampling. Canonical 512-sample PCM/FFT rows are borrowed directly.
             let scratch = &mut wv.scratch;
             let (src_l, src_r): (&[f32], &[f32]) = if pf_spectrum && !freq.is_empty() {
                 if freq.len() == max_samples {
@@ -7114,8 +7978,168 @@ impl MilkdropRenderer {
         }
     }
 
+    /// Encode the shared blur pyramid. `source_is_write` selects the just-warped
+    /// feedback page for the legacy order, or the prior feedback page for the
+    /// opt-in BeatDrop provenance order.
+    fn encode_blur_chain(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        source_is_write: bool,
+    ) -> u32 {
+        if self.blur_levels == 0 {
+            return 0;
+        }
+
+        let source_is_a = if source_is_write {
+            self.write_to_a
+        } else {
+            !self.write_to_a
+        };
+        let blur1_h_bg = if source_is_a {
+            &self.blur1_h_bg_a
+        } else {
+            &self.blur1_h_bg_b
+        };
+        encode_blur_pass(
+            encoder,
+            "blur1-h",
+            &self.blur_h_pipeline,
+            blur1_h_bg,
+            &self.view_btemp1,
+        );
+        generate_mip_chain(
+            &self.device,
+            &self.feedback_mip_blitter,
+            encoder,
+            &self.btemp_mips1,
+        );
+        encode_blur_pass(
+            encoder,
+            "blur1-v",
+            &self.blur_v_pipeline,
+            &self.blur1_v_bg,
+            &self.view_blur1,
+        );
+        generate_mip_chain(
+            &self.device,
+            &self.feedback_mip_blitter,
+            encoder,
+            &self.blur_mips1,
+        );
+        let mut count = 2;
+
+        if self.blur_levels >= 2 {
+            encode_blur_pass(
+                encoder,
+                "blur2-h",
+                &self.blur_h_pipeline,
+                &self.blur2_h_bg,
+                &self.view_btemp2,
+            );
+            generate_mip_chain(
+                &self.device,
+                &self.feedback_mip_blitter,
+                encoder,
+                &self.btemp_mips2,
+            );
+            encode_blur_pass(
+                encoder,
+                "blur2-v",
+                &self.blur_v_pipeline,
+                &self.blur2_v_bg,
+                &self.view_blur2,
+            );
+            generate_mip_chain(
+                &self.device,
+                &self.feedback_mip_blitter,
+                encoder,
+                &self.blur_mips2,
+            );
+            count += 2;
+
+            if self.blur_levels >= 3 {
+                encode_blur_pass(
+                    encoder,
+                    "blur3-h",
+                    &self.blur_h_pipeline,
+                    &self.blur3_h_bg,
+                    &self.view_btemp3,
+                );
+                generate_mip_chain(
+                    &self.device,
+                    &self.feedback_mip_blitter,
+                    encoder,
+                    &self.btemp_mips3,
+                );
+                encode_blur_pass(
+                    encoder,
+                    "blur3-v",
+                    &self.blur_v_pipeline,
+                    &self.blur3_v_bg,
+                    &self.view_blur3,
+                );
+                generate_mip_chain(
+                    &self.device,
+                    &self.feedback_mip_blitter,
+                    encoder,
+                    &self.blur_mips3,
+                );
+                count += 2;
+            }
+        }
+        count
+    }
+
+    /// Draw already-uploaded motion vector geometry into one feedback page.
+    /// Kept separate from the authored overlay pass so opt-in provenance can
+    /// place it before warp without changing legacy ordering.
+    fn encode_motion_vectors(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        label: &'static str,
+        count: u32,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(label),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.mv_pipeline);
+        pass.set_bind_group(0, &self.mv_bg, &[]);
+        pass.set_vertex_buffer(0, self.mv_vert_buf.slice(..));
+        pass.draw(0..count, 0..1);
+    }
+
     pub fn render(&mut self, surface_view: &wgpu::TextureView) {
-        self.render_impl(surface_view, None);
+        self.render_impl(Some(surface_view), None, None, None, None);
+    }
+
+    /// Advance one live MilkDrop frame and retain the post-COMP Rgba8 result
+    /// for a caller-owned compositor. This skips the renderer's FXAA/output
+    /// pass and its full-size HDR write; [`Self::retained_comp_view`] remains
+    /// valid until a resize or performance-profile scale change.
+    pub fn render_to_retained_comp(&mut self) {
+        self.render_impl(None, None, None, None, None);
+    }
+
+    /// Texture produced by [`Self::render_to_retained_comp`].
+    pub fn retained_comp_view(&self) -> &wgpu::TextureView {
+        &self.comp_view
     }
 
     /// Render one frame while writing timestamps around OjoDrop's GPU command
@@ -7130,15 +8154,115 @@ impl MilkdropRenderer {
         end_index: u32,
     ) {
         self.render_impl(
-            surface_view,
+            Some(surface_view),
             Some((query_set, boundary_marker, start_index, end_index)),
+            None,
+            None,
+            None,
         );
+    }
+
+    /// Profiled counterpart of [`Self::render_to_retained_comp`].
+    pub fn render_to_retained_comp_profiled(
+        &mut self,
+        query_set: &wgpu::QuerySet,
+        boundary_marker: &wgpu::Buffer,
+        start_index: u32,
+        end_index: u32,
+    ) {
+        self.render_impl(
+            None,
+            Some((query_set, boundary_marker, start_index, end_index)),
+            None,
+            None,
+            None,
+        );
+    }
+
+    /// Render a supported native shared-feedback transition into `surface_view`.
+    ///
+    /// `self` is the visible outgoing state and `target` is the incoming state
+    /// owned by the runtime. Both state machines advance each call. Their
+    /// evaluated warp UVs (and per-vertex decay) are blended *before* one warp
+    /// mesh samples the outgoing feedback history. The target is then reseeded
+    /// from that shared history, so the runtime can promote it on completion or
+    /// interruption without an image reset. `false` means the caller must use
+    /// its existing crossfade/fallback path.
+    ///
+    /// Shaderless pairs may include built-in/custom waves and static
+    /// untextured, borderless shapes: their independently evaluated geometry is
+    /// composited at complementary opacity in the shared post-warp pass. Custom
+    /// shaders, textured/dynamic shapes, motion vectors, darken-center, and
+    /// frame/shape borders remain explicit fallback cases. This is not arbitrary
+    /// shader-pair or full-preset transition parity.
+    pub fn render_shared_feedback(
+        &mut self,
+        surface_view: &wgpu::TextureView,
+        progress: f32,
+        target: &mut Self,
+    ) -> bool {
+        self.render_shared_feedback_impl(Some(surface_view), progress, target)
+    }
+
+    /// Retained-COMP counterpart of [`Self::render_shared_feedback`]. This
+    /// preserves the parent renderer's retained composition/direct-HDR split.
+    pub fn render_shared_feedback_to_retained_comp(
+        &mut self,
+        progress: f32,
+        target: &mut Self,
+    ) -> bool {
+        self.render_shared_feedback_impl(None, progress, target)
+    }
+
+    fn render_shared_feedback_impl(
+        &mut self,
+        surface_view: Option<&wgpu::TextureView>,
+        progress: f32,
+        target: &mut Self,
+    ) -> bool {
+        if !progress.is_finite() || !self.supports_shared_feedback(target) {
+            return false;
+        }
+        let progress = progress.clamp(0.0, 1.0);
+
+        // Advance the target's independent equations and evaluate its CPU warp
+        // mesh without presenting its own feedback result. This currently uses a
+        // complete hidden GPU frame to keep state ordering identical. Its
+        // evaluated compatible overlay geometry is then redrawn into the
+        // outgoing shared post-warp pass at complementary opacity.
+        target.mirror_shared_feedback_inputs_from(self);
+        let was_forced = target.force_cpu_warp_mesh;
+        target.force_cpu_warp_mesh = true;
+        target.render_impl(None, None, None, None, None);
+        target.force_cpu_warp_mesh = was_forced;
+
+        // A compatible target was force-evaluated above, so a length mismatch is
+        // an internal invariant failure rather than a visually plausible image
+        // blend. Return the ordinary fallback without advancing outgoing state.
+        if target.scratch.warp_verts.len() != ((GRID_W + 1) * (GRID_H + 1)) as usize {
+            return false;
+        }
+        self.render_impl(
+            surface_view,
+            None,
+            Some((&target.scratch.warp_verts, progress)),
+            Some((&target.last_comp_perframe, progress)),
+            Some((&*target, progress)),
+        );
+
+        // Keep the target promotable after *every* frame, not only at p == 1.
+        // This documents and implements the interruption policy: the current
+        // incoming target may become the next winner with continuous feedback.
+        target.seed_feedback_from(self)
     }
 
     fn render_impl(
         &mut self,
-        surface_view: &wgpu::TextureView,
+        surface_view: Option<&wgpu::TextureView>,
         timestamp_writes: Option<(&wgpu::QuerySet, &wgpu::Buffer, u32, u32)>,
+        shared_warp: Option<(&[WarpVert], f32)>,
+        shared_comp: Option<(&PerFrame, f32)>,
+        shared_overlays: Option<(&Self, f32)>,
     ) {
         let t = self
             .frame_time_override
@@ -7340,23 +8464,21 @@ impl MilkdropRenderer {
         }
         self.vol_prev = vol;
 
-        // Helper: read f64 var from EEL env, default 0
-        let eq = |k: &str| {
-            let value = self.eel_env.get(k).copied().unwrap_or(0.0);
-            if value.is_finite() {
-                value as f32
-            } else {
-                0.0
-            }
-        };
-        // Helper: read f64 var from EEL env, default to `def` if missing
+        // Helper: read f64 var from EEL env, default 0.
+        //
+        // Finiteness is tested AFTER the narrowing cast, for the same reason as
+        // `eqd` below — see `finite_f32_from_f64`. This closure carried the
+        // identical pre-cast bug until 2026-08-15: `1e300_f64.is_finite()` is
+        // true and `1e300_f64 as f32` is `+inf`, so a per-frame EEL `q1 = 1e300`
+        // reached `_qa.._qh` (q1..q32), `f_shader`, `echo_alpha` and
+        // `echo_orientation` in `comp_pf` — the same `comp_perframe_buf` the blur
+        // guard protects.
+        let eq = |k: &str| finite_f32_from_f64(self.eel_env.get(k).copied().unwrap_or(0.0), 0.0);
+        // Helper: read f64 var from EEL env, default to `def` if missing.
+        // Finiteness is tested AFTER the narrowing cast — see
+        // `finite_f32_from_f64`; testing the f64 lets `1e300` through as `+inf`.
         let eqd = |k: &str, def: f64| {
-            let value = self.eel_env.get(k).copied().unwrap_or(def);
-            if value.is_finite() {
-                value as f32
-            } else {
-                def as f32
-            }
+            finite_f32_from_f64(self.eel_env.get(k).copied().unwrap_or(def), def)
         };
         let base_gamma = self.comp_gamma_adj as f64;
         let gamma = eqd("gamma", base_gamma);
@@ -7403,58 +8525,24 @@ impl MilkdropRenderer {
         // comp/warp GetBlurN helpers apply the inverse (scale1..3, bias1..3) to recover
         // the original range. At defaults (min 0, max 1) both halves are identity.
         let (blur_sb, comp_blur) = {
-            let mut bmin = [
-                eqd("b1n", self.b1n as f64),
-                eqd("b2n", self.b2n as f64),
-                eqd("b3n", self.b3n as f64),
-            ];
-            let mut bmax = [
-                eqd("b1x", self.b1x as f64),
-                eqd("b2x", self.b2x as f64),
-                eqd("b3x", self.b3x as f64),
-            ];
-            let fmin_dist = 0.1f32;
-            // Preserve Butterchurn's published compatibility behavior exactly:
-            // narrow ranges assign BOTH endpoints to avg-0.05. This can produce
-            // Inf/NaN downstream, but widening the range gives a different image.
-            if bmax[0] - bmin[0] < fmin_dist {
-                let a = (bmin[0] + bmax[0]) * 0.5;
-                bmin[0] = a - fmin_dist * 0.5;
-                bmax[0] = a - fmin_dist * 0.5;
-            }
-            bmax[1] = bmax[1].min(bmax[0]);
-            bmin[1] = bmin[1].max(bmin[0]);
-            if bmax[1] - bmin[1] < fmin_dist {
-                let a = (bmin[1] + bmax[1]) * 0.5;
-                bmin[1] = a - fmin_dist * 0.5;
-                bmax[1] = a - fmin_dist * 0.5;
-            }
-            bmax[2] = bmax[2].min(bmax[1]);
-            bmin[2] = bmin[2].max(bmin[1]);
-            if bmax[2] - bmin[2] < fmin_dist {
-                let a = (bmin[2] + bmax[2]) * 0.5;
-                bmin[2] = a - fmin_dist * 0.5;
-                bmax[2] = a - fmin_dist * 0.5;
-            }
+            let (bmin, bmax) = blur_min_max_remap(
+                [
+                    eqd("b1n", self.b1n as f64),
+                    eqd("b2n", self.b2n as f64),
+                    eqd("b3n", self.b3n as f64),
+                ],
+                [
+                    eqd("b1x", self.b1x as f64),
+                    eqd("b2x", self.b2x as f64),
+                    eqd("b3x", self.b3x as f64),
+                ],
+            );
             // blur-shader scale/bias (normalize into [0,1]) — butterchurn getScaleAndBias.
-            let mut scale = [1.0f32; 3];
-            let mut bias = [0.0f32; 3];
-            scale[0] = 1.0 / (bmax[0] - bmin[0]);
-            bias[0] = -bmin[0] * scale[0];
-            let t_min1 = (bmin[1] - bmin[0]) / (bmax[0] - bmin[0]);
-            let t_max1 = (bmax[1] - bmin[0]) / (bmax[0] - bmin[0]);
-            scale[1] = 1.0 / (t_max1 - t_min1);
-            bias[1] = -t_min1 * scale[1];
-            let t_min2 = (bmin[2] - bmin[1]) / (bmax[1] - bmin[1]);
-            let t_max2 = (bmax[2] - bmin[1]) / (bmax[1] - bmin[1]);
-            scale[2] = 1.0 / (t_max2 - t_min2);
-            bias[2] = -t_min2 * scale[2];
-            // comp/warp-side inverse (butterchurn comp.js): scaleN = maxN-minN, biasN = minN.
-            // (level 2/3 use the level-1 base in butterchurn's comp; mirror its actual code.)
+            let (scale, bias) = blur_scale_and_bias(bmin, bmax);
             (
                 [scale, bias],
                 // comp uniforms: blur1_min/max + scale1/2/3 + bias1/2/3
-                (
+                guard_finite_comp_blur(
                     bmin,
                     bmax,
                     [bmax[0] - bmin[0], bmax[1] - bmin[1], bmax[2] - bmin[2]],
@@ -7554,14 +8642,11 @@ impl MilkdropRenderer {
             darken: eqd("darken", if self.comp_darken { 1.0 } else { 0.0 }),
             solarize: eqd("solarize", if self.comp_solarize { 1.0 } else { 0.0 }),
             invert: eqd("invert", if self.comp_invert { 1.0 } else { 0.0 }),
+            audio_nyquist_hz: self.enhanced_audio_nyquist_hz,
             ..bytemuck::Zeroable::zeroed()
         };
 
-        // ── Blur range-remap and edge fade: write live b1ed to level 1's vertical
-        // edge vector and per-level sb (scale,bias) to the blur UBOs. Butterchurn
-        // applies b1ed only to the first blur level; deeper levels use no edge fade.
-        let scale = blur_sb[0];
-        let bias = blur_sb[1];
+        let (scale, bias) = guard_finite_blur_scale_bias(blur_sb[0], blur_sb[1]);
         let live_b1ed_raw = eqd("b1ed", self.b1ed as f64);
         let live_b1ed = if live_b1ed_raw.is_finite() {
             live_b1ed_raw.clamp(0.0, 1.0)
@@ -7604,13 +8689,28 @@ impl MilkdropRenderer {
         let requested_mv_y = live_mv_y.floor() as i32;
         let motion_vectors_requested =
             self.mv_on && live_mv_a > 0.001 && requested_mv_x > 0 && requested_mv_y > 0;
-        let use_cpu_mesh = self.per_pixel_prog.is_some() || motion_vectors_requested;
+        // Native shared-feedback morphs need both states' evaluated meshes even
+        // for equation-free presets. The ordinary renderer keeps its legacy
+        // shader-side mesh fast path unless a per-pixel program or motion vectors
+        // already require CPU evaluation.
+        let use_cpu_mesh = self.per_pixel_prog.is_some()
+            || motion_vectors_requested
+            || self.force_cpu_warp_mesh
+            || shared_warp.is_some();
         let warp_params =
             self.warp_gpu_params(shader_t, shape_aspectx, shape_aspecty, use_cpu_mesh);
         self.queue
             .write_buffer(&self.warp_params_buf, 0, bytemuck::bytes_of(&warp_params));
         if use_cpu_mesh {
             self.compute_warp_verts(&warp_params);
+            if let Some((target_mesh, progress)) = shared_warp {
+                let blended = blend_evaluated_warp_mesh(
+                    &mut self.scratch.warp_verts,
+                    target_mesh,
+                    progress,
+                );
+                debug_assert!(blended, "compatible shared-feedback meshes must match");
+            }
             self.queue.write_buffer(
                 &self.warp_vert_buf,
                 0,
@@ -7636,7 +8736,7 @@ impl MilkdropRenderer {
         // = 0 in shape eqs, e.g. idx 7550's `a = floor(rand(floor(q30)))/5` → alpha 0).
         let qsnap = std::array::from_fn(|i| self.eel_env.slot_value(self.eel_q_slots[i]));
 
-        let (fill_verts, fill_draws, border_verts, border_draws) = self.build_shape_geometry(
+        let (mut fill_verts, fill_draws, border_verts, border_draws) = self.build_shape_geometry(
             t,
             bass,
             mid,
@@ -7663,7 +8763,7 @@ impl MilkdropRenderer {
         // freqArray for bSpectrum custom waves (mono, 512 bins). Empty in the
         // headless/synthetic path → build_custom_waves falls back to time data.
         let freq = std::mem::take(&mut self.freq_spectrum);
-        let (wave_verts, wave_draws, custom_wave_extent) = self.build_wave_geometry(
+        let (mut wave_verts, wave_draws, custom_wave_extent) = self.build_wave_geometry(
             t,
             bass,
             mid,
@@ -7725,6 +8825,10 @@ impl MilkdropRenderer {
             .write_buffer(&self.perframe_buf, 0, bytemuck::bytes_of(&pf));
         let mut comp_pf = pf;
         comp_pf.rand_frame = comp_rand_frame;
+        if let Some((incoming_comp, progress)) = shared_comp {
+            let _ = blend_comp_perframe(&mut comp_pf, incoming_comp, progress);
+        }
+        self.last_comp_perframe = comp_pf;
         self.queue
             .write_buffer(&self.comp_perframe_buf, 0, bytemuck::bytes_of(&comp_pf));
         generate_comp_verts(shader_t, self.rand_start, &mut self.scratch.comp_verts);
@@ -7733,6 +8837,43 @@ impl MilkdropRenderer {
             0,
             bytemuck::cast_slice(&self.scratch.comp_verts),
         );
+
+        // The shared-feedback path has one post-warp feedback page. Preserve
+        // both independently evaluated overlay states by weighting outgoing
+        // vertices here, then placing weighted incoming copies in the target's
+        // existing GPU buffers below. We intentionally retain the target's
+        // unweighted CPU geometry so it is valid immediately if promoted.
+        if let Some((target, transition_progress)) = shared_overlays {
+            let incoming_weight = transition_progress.clamp(0.0, 1.0);
+            weight_shape_overlay_vertices(&mut fill_verts, 1.0 - incoming_weight);
+            weight_wave_overlay_vertices(&mut wave_verts, 1.0 - incoming_weight);
+
+            let shared_shapes = &mut self.scratch.shared_shape_fill_verts;
+            shared_shapes.clear();
+            shared_shapes.extend_from_slice(&target.scratch.shape_fill_verts);
+            weight_shape_overlay_vertices(shared_shapes, incoming_weight);
+            if !shared_shapes.is_empty() {
+                let n = shared_shapes.len().min(SHAPE_VERT_CAP);
+                self.queue.write_buffer(
+                    &target.shape_vert_buf,
+                    0,
+                    bytemuck::cast_slice(&shared_shapes[..n]),
+                );
+            }
+
+            let shared_waves = &mut self.scratch.shared_wave_verts;
+            shared_waves.clear();
+            shared_waves.extend_from_slice(&target.scratch.wave_verts);
+            weight_wave_overlay_vertices(shared_waves, incoming_weight);
+            if !shared_waves.is_empty() {
+                let n = shared_waves.len().min(WAVE_VERT_CAP);
+                self.queue.write_buffer(
+                    &target.wave_vert_buf,
+                    0,
+                    bytemuck::cast_slice(&shared_waves[..n]),
+                );
+            }
+        }
 
         // Upload all geometry up-front (no write_buffer inside a render pass).
         if !fill_verts.is_empty() {
@@ -7759,8 +8900,6 @@ impl MilkdropRenderer {
                 bytemuck::cast_slice(&wave_verts[..n]),
             );
         }
-        // (The dead ShapeU textured-flag write was removed — P2-VIS-032. The
-        // per-shape textured flag is carried by a negative-UV vertex sentinel.)
 
         // One texel-size uniform; the vertex shader expands thick lines/dots from
         // `instance_index`, replacing 4/9 CPU draw calls with one instanced draw.
@@ -8074,19 +9213,36 @@ impl MilkdropRenderer {
         }
         let border_draws_frame = &self.scratch.frame_border_draws;
 
-        // Ping-pong: write_to_a determines current target
-        let (write_texture, write_view, read_bg, comp_bg) = match (self.write_to_a, live_wrap) {
-            (true, true) => (&self.tex_a, &self.view_a, &self.bg_read_b, &self.bg_read_a),
-            (false, true) => (&self.tex_b, &self.view_b, &self.bg_read_a, &self.bg_read_b),
+        // Ping-pong: write_to_a determines current target. Keep the prior page
+        // view explicit because BeatDrop provenance writes motion vectors and
+        // derives blur from it before the warp samples it.
+        let (write_texture, write_view, read_view, read_bg, comp_bg) =
+            match (self.write_to_a, live_wrap) {
+            (true, true) => (
+                &self.tex_a,
+                &self.view_a,
+                &self.view_b,
+                &self.bg_read_b,
+                &self.bg_read_a,
+            ),
+            (false, true) => (
+                &self.tex_b,
+                &self.view_b,
+                &self.view_a,
+                &self.bg_read_a,
+                &self.bg_read_b,
+            ),
             (true, false) => (
                 &self.tex_a,
                 &self.view_a,
+                &self.view_b,
                 &self.bg_read_b_clamp,
                 &self.bg_read_a_clamp,
             ),
             (false, false) => (
                 &self.tex_b,
                 &self.view_b,
+                &self.view_a,
                 &self.bg_read_a_clamp,
                 &self.bg_read_b_clamp,
             ),
@@ -8098,7 +9254,42 @@ impl MilkdropRenderer {
             enc.clear_buffer(boundary_marker, 0, None);
         }
 
-        // --- WARP pass. Blur must observe this surface before overlays. ---
+        let beatdrop_feedback = self.feedback_provenance == FeedbackProvenance::Beatdrop;
+        if beatdrop_feedback {
+            // BeatDrop's feedback provenance: inject motion vectors into the
+            // outgoing page first, then derive this frame's blur from that page.
+            // This is opt-in; the default follows the legacy order below.
+            self.encode_motion_vectors(
+                &mut enc,
+                read_view,
+                "feedback-motion-vectors-before-warp",
+                mv_count,
+            );
+            // The previous page's sampling view covers every feedback mip. The
+            // vector pass just changed level 0, so rebuild its chain before the
+            // blur (and later warp) sample it. Without this, derivative-selected
+            // samples could observe stale pre-vector history at nonzero LOD.
+            if mv_count > 0 {
+                let previous_feedback_mips = if self.write_to_a {
+                    &self.feedback_mips_b
+                } else {
+                    &self.feedback_mips_a
+                };
+                generate_mip_chain(
+                    &self.device,
+                    &self.feedback_mip_blitter,
+                    &mut enc,
+                    previous_feedback_mips,
+                );
+            }
+        }
+        let mut blur_pass_count = if beatdrop_feedback {
+            self.encode_blur_chain(&mut enc, false)
+        } else {
+            0
+        };
+
+        // --- WARP pass. Legacy blur observes this surface before overlays. ---
         {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("feedback-warp"),
@@ -8150,102 +9341,11 @@ impl MilkdropRenderer {
             );
         }
 
-        // Butterchurn builds blur from the warped feedback before motion vectors,
-        // shapes, waves, darken-center, or borders are composited. Warp shaders
-        // therefore see the previous frame's blur, while comp sees this frame's
-        // freshly generated warp-only pyramid.
-        let mut blur_pass_count = 0u32;
-        if self.blur_levels >= 1 {
-            let blur1_h_bg = if self.write_to_a {
-                &self.blur1_h_bg_a
-            } else {
-                &self.blur1_h_bg_b
-            };
-            encode_blur_pass(
-                &mut enc,
-                "blur1-h",
-                &self.blur_h_pipeline,
-                blur1_h_bg,
-                &self.view_btemp1,
-            );
-            generate_mip_chain(
-                &self.device,
-                &self.feedback_mip_blitter,
-                &mut enc,
-                &self.btemp_mips1,
-            );
-            encode_blur_pass(
-                &mut enc,
-                "blur1-v",
-                &self.blur_v_pipeline,
-                &self.blur1_v_bg,
-                &self.view_blur1,
-            );
-            generate_mip_chain(
-                &self.device,
-                &self.feedback_mip_blitter,
-                &mut enc,
-                &self.blur_mips1,
-            );
-            blur_pass_count += 2;
-            if self.blur_levels >= 2 {
-                encode_blur_pass(
-                    &mut enc,
-                    "blur2-h",
-                    &self.blur_h_pipeline,
-                    &self.blur2_h_bg,
-                    &self.view_btemp2,
-                );
-                generate_mip_chain(
-                    &self.device,
-                    &self.feedback_mip_blitter,
-                    &mut enc,
-                    &self.btemp_mips2,
-                );
-                encode_blur_pass(
-                    &mut enc,
-                    "blur2-v",
-                    &self.blur_v_pipeline,
-                    &self.blur2_v_bg,
-                    &self.view_blur2,
-                );
-                generate_mip_chain(
-                    &self.device,
-                    &self.feedback_mip_blitter,
-                    &mut enc,
-                    &self.blur_mips2,
-                );
-                blur_pass_count += 2;
-                if self.blur_levels >= 3 {
-                    encode_blur_pass(
-                        &mut enc,
-                        "blur3-h",
-                        &self.blur_h_pipeline,
-                        &self.blur3_h_bg,
-                        &self.view_btemp3,
-                    );
-                    generate_mip_chain(
-                        &self.device,
-                        &self.feedback_mip_blitter,
-                        &mut enc,
-                        &self.btemp_mips3,
-                    );
-                    encode_blur_pass(
-                        &mut enc,
-                        "blur3-v",
-                        &self.blur_v_pipeline,
-                        &self.blur3_v_bg,
-                        &self.view_blur3,
-                    );
-                    generate_mip_chain(
-                        &self.device,
-                        &self.feedback_mip_blitter,
-                        &mut enc,
-                        &self.blur_mips3,
-                    );
-                    blur_pass_count += 2;
-                }
-            }
+        // Legacy provenance derives blur from the freshly warped page before
+        // authored overlays. BeatDrop provenance already built blur from the
+        // previous page before warp, above.
+        if !beatdrop_feedback {
+            blur_pass_count = self.encode_blur_chain(&mut enc, true);
         }
         self.last_blur_pass_count = blur_pass_count;
         // Overlay pass loads the warp result and preserves MilkDrop's authored
@@ -8269,8 +9369,10 @@ impl MilkdropRenderer {
                 multiview_mask: None,
             });
 
-            // Motion vectors precede authored shapes/waves.
-            if mv_count > 0 {
+            // Motion vectors precede authored shapes/waves in the legacy path.
+            // BeatDrop provenance emitted them into the previous feedback page
+            // before warp, so it must not draw a second copy here.
+            if mv_count > 0 && !beatdrop_feedback {
                 rp.set_pipeline(&self.mv_pipeline);
                 rp.set_bind_group(0, &self.mv_bg, &[]);
                 rp.set_vertex_buffer(0, self.mv_vert_buf.slice(..));
@@ -8372,6 +9474,65 @@ impl MilkdropRenderer {
                 }
             }
 
+            // The incoming state evaluated and uploaded weighted copies before
+            // this pass opened. Draw its compatible untextured shapes/waves
+            // after the outgoing state, preserving each renderer's internal
+            // authored order while making both families visible before promotion.
+            if let Some((target, _)) = shared_overlays {
+                let target_fill_draws = &target.scratch.shape_fill_draws;
+                if !target_fill_draws.is_empty() {
+                    rp.set_index_buffer(target.shape_idx_buf.slice(..), wgpu::IndexFormat::Uint32);
+                    rp.set_vertex_buffer(0, target.shape_vert_buf.slice(..));
+                    // Compatibility rejects textured shapes, so the shader never
+                    // samples this bind group; it is still required by WGSL.
+                    rp.set_bind_group(0, &target.shape_bg_read_a, &[]);
+                    let mut last_additive = None;
+                    for draw in target_fill_draws {
+                        if draw.base_vertex as u32 + draw.sides + 2 > SHAPE_VERT_CAP as u32 {
+                            continue;
+                        }
+                        if last_additive != Some(draw.additive) {
+                            rp.set_pipeline(if draw.additive {
+                                &target.shapes_fill_pipeline_additive
+                            } else {
+                                &target.shapes_fill_pipeline_alpha
+                            });
+                            last_additive = Some(draw.additive);
+                        }
+                        rp.draw_indexed(0..(draw.sides * 3), draw.base_vertex, 0..1);
+                    }
+                }
+
+                let target_wave_draws = &target.scratch.wave_draws;
+                if !target_wave_draws.is_empty() {
+                    rp.set_vertex_buffer(0, target.wave_vert_buf.slice(..));
+                    rp.set_bind_group(0, &target.wave_bg, &[]);
+                    for draw in target_wave_draws {
+                        let pipe = match (draw.points, draw.additive) {
+                            (true, true) => &target.wave_pipeline_points_additive,
+                            (true, false) => &target.wave_pipeline_points_alpha,
+                            (false, true) => &target.wave_pipeline_lines_additive,
+                            (false, false) => &target.wave_pipeline_lines_alpha,
+                        };
+                        rp.set_pipeline(pipe);
+                        if draw.start_vert >= WAVE_VERT_CAP as u32 {
+                            continue;
+                        }
+                        let end = (draw.start_vert + draw.count).min(WAVE_VERT_CAP as u32);
+                        let passes = if draw.thick {
+                            if draw.points {
+                                WAVE_THICK_DOT_PASSES
+                            } else {
+                                WAVE_THICK_LINE_PASSES
+                            }
+                        } else {
+                            1
+                        };
+                        rp.draw(draw.start_vert..end, 0..passes as u32);
+                    }
+                }
+            }
+
             // Darken-center and frame borders follow waves.
             if darken_on {
                 rp.set_pipeline(&self.darken_pipeline);
@@ -8415,10 +9576,10 @@ impl MilkdropRenderer {
         // With FXAA enabled we render into the offscreen comp intermediate so the
         // FXAA output pass can read it; with FXAA disabled we skip that round-trip
         // and write the swapchain directly.
-        let comp_target: &wgpu::TextureView = if self.fxaa_enabled {
+        let comp_target: &wgpu::TextureView = if self.fxaa_enabled || surface_view.is_none() {
             &self.comp_view
         } else {
-            surface_view
+            surface_view.expect("direct output requires a surface")
         };
         {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -8437,7 +9598,11 @@ impl MilkdropRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            rp.set_pipeline(&self.comp_pipeline);
+            rp.set_pipeline(if self.fxaa_enabled || surface_view.is_none() {
+                &self.comp_pipeline
+            } else {
+                &self.comp_direct_pipeline
+            });
             rp.set_bind_group(0, comp_bg, &[]);
             rp.set_bind_group(1, &self.comp_perframe_bg, &[]);
             rp.set_vertex_buffer(0, self.comp_vert_buf.slice(..));
@@ -8460,11 +9625,11 @@ impl MilkdropRenderer {
         // Fullscreen triangle covers 100% → LoadOp::Clear (no needless read).
         // Skipped entirely when FXAA is disabled: COMP already wrote the
         // swapchain directly above, so there is nothing to resolve.
-        if self.fxaa_enabled {
+        if self.fxaa_enabled && surface_view.is_some() {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("fxaa-output"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: surface_view,
+                    view: surface_view.expect("FXAA output requires a surface"),
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -8503,11 +9668,6 @@ impl MilkdropRenderer {
     }
 }
 
-/// Resample `src` to exactly `target_len` samples by linear interpolation across
-/// the source index range. Returns empty when either input is degenerate. Used to
-/// adapt the FFT (frequency) and PCM (waveform) audio arrays to a custom
-/// waveform's working length INDEPENDENTLY, so a valid FFT is never discarded for
-/// a mere length mismatch (P2-VIS-031).
 pub(crate) fn resample_linear(src: &[f32], target_len: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(target_len);
     resample_linear_into(src, target_len, &mut out, false);
@@ -8557,13 +9717,6 @@ fn replace_audio_samples(
     resample_linear_into(source, target_len, destination, clamp_waveform);
 }
 
-/// Per-sample source arrays for one custom waveform, each resampled to
-/// `target_len`. A `spectrum` wave draws from the FFT (`freq`) array; a
-/// time-domain wave draws from the PCM (`time_*`) arrays. The FFT is resampled
-/// INDEPENDENTLY of the PCM length — a valid FFT is used even when its length
-/// differs from the PCM length, rather than silently falling back to time-domain
-/// data on a length mismatch (P2-VIS-031). Time data is used only when there is
-/// no spectrum data available.
 fn custom_wave_sources(
     spectrum: bool,
     time_l: &[f32],
@@ -8716,22 +9869,354 @@ fn emit_smoothed_wave_and_color(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "app")]
-    use super::MilkdropRenderer;
+    use crate::enhanced_audio::{EnhancedAudioConfig, ENHANCED_FFT_BINS};
     use super::{
-        blur_dimensions, build_comp_indices, compile_milkdrop_shader_bodies_from_parts,
+        audio_att_floor, audio_level_floor, blend_evaluated_warp_mesh, blur_dimensions, blur_min_max_remap,
+        blur_scale_and_bias, build_comp_indices, compile_milkdrop_shader_bodies_from_parts,
         deterministic_time_seconds, downsample_rgba_volume, effective_fps,
-        emit_smoothed_wave_and_color, generate_comp_verts, milkdrop_angle, needed_blur_levels,
+        emit_smoothed_wave_and_color, finite_f32_from_f64, generate_comp_verts,
+        guard_finite_blur_scale_bias, guard_finite_comp_blur, milkdrop_angle, needed_blur_levels,
         resample_linear, resample_linear_into, rgba8_rgb_summary, seed_equation_inputs,
         shader_frame_index, shader_progress, shader_time_seconds, smooth_wave_and_color,
         summarize_custom_geometry, validate_texture_dims, BorderDraw, BorderVert, ButterchurnRng,
         DimensionError, GeometryDiagnosticCollector, MilkdropGeometryDiagnostics,
         MilkdropResizeDebouncer, ShapeFillDraw, ShapeVert, WaveDraw, WaveVert, COMP_GRID_H,
         COMP_GRID_W, GPU_FRAME_WRAP, GPU_TIME_WRAP_SECONDS, GRID_H, GRID_W,
-        INTERACTIVE_RESIZE_DEBOUNCE,
+        INTERACTIVE_RESIZE_DEBOUNCE, WarpVert,
     };
+    #[cfg(feature = "app")]
+    use super::{MilkdropPerformanceProfile, MilkdropRenderer};
     use std::cell::Cell;
     use std::time::{Duration, Instant};
+
+
+    /// The hazard is real and upstream-faithful: pins the zero-width collapse itself, so
+    /// a later "parity restoration" of `blur_min_max_remap`'s sign is caught here rather
+    /// than by silently making the guard below dead code.
+    #[test]
+    fn blur_remap_collapses_a_narrow_range_to_exactly_zero_width() {
+        let (bmin, bmax) = blur_min_max_remap([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
+        // Both endpoints get `avg - fmin_dist * 0.5` — the upstream minus-on-max slip.
+        assert_eq!(
+            bmax[0] - bmin[0],
+            0.0,
+            "level 1 range must collapse to zero"
+        );
+        assert_eq!(
+            bmax[1] - bmin[1],
+            0.0,
+            "level 2 range must collapse to zero"
+        );
+        assert_eq!(
+            bmax[2] - bmin[2],
+            0.0,
+            "level 3 range must collapse to zero"
+        );
+        assert!((bmin[0] - -0.05).abs() < 1e-6, "bmin[0] = {}", bmin[0]);
+        assert!((bmin[1] - -0.075).abs() < 1e-6, "bmin[1] = {}", bmin[1]);
+        assert!((bmin[2] - -0.0875).abs() < 1e-6, "bmin[2] = {}", bmin[2]);
+    }
+
+    /// The unguarded transform really does emit the recorded Inf/NaN. Without this the
+    /// guard test could pass vacuously on inputs that were never dangerous.
+    #[test]
+    fn blur_scale_and_bias_is_non_finite_on_the_recorded_evidence_pattern() {
+        // NaN case — all six blur bounds zero (13 of the 14 affected presets).
+        let (bmin, bmax) = blur_min_max_remap([0.0, 0.0, 0.0], [0.0, 0.0, 0.0]);
+        let (scale, bias) = blur_scale_and_bias(bmin, bmax);
+        assert!(scale[0].is_infinite(), "scale[0] = {}", scale[0]);
+        assert!(bias[0].is_infinite(), "bias[0] = {}", bias[0]);
+        assert!(scale[1].is_nan(), "scale[1] = {}", scale[1]);
+        assert!(bias[1].is_nan(), "bias[1] = {}", bias[1]);
+        assert!(scale[2].is_nan(), "scale[2] = {}", scale[2]);
+        assert!(bias[2].is_nan(), "bias[2] = {}", bias[2]);
+
+        // Inf-only case — level 1 is a healthy [0,1], only level 2 is narrower than
+        // fmin_dist. Covers the other residual form the addendum names.
+        let (bmin, bmax) = blur_min_max_remap([0.0, 0.5, 0.0], [1.0, 0.5, 1.0]);
+        let (scale, bias) = blur_scale_and_bias(bmin, bmax);
+        assert!(scale[0].is_finite(), "scale[0] = {}", scale[0]);
+        assert!(scale[1].is_infinite(), "scale[1] = {}", scale[1]);
+        assert!(bias[1].is_infinite(), "bias[1] = {}", bias[1]);
+    }
+
+
+    /// Mechanism (a): the pre-cast finiteness trap. `1e300_f64` IS finite, and
+    /// `1e300_f64 as f32` IS `+inf` — Rust's float cast saturates. The old `eqd`
+    /// tested the `f64`, so this value passed the guard and poisoned the uniforms.
+    #[test]
+    fn eqd_narrowing_rejects_an_f64_that_is_finite_but_overflows_f32() {
+        // The exact value from the reviewer's reproduction.
+        assert!(1e300_f64.is_finite(), "premise: the f64 is finite");
+        assert!(
+            !(1e300_f64 as f32).is_finite(),
+            "premise: the cast saturates to inf"
+        );
+        assert_eq!(finite_f32_from_f64(1e300, 0.25), 0.25);
+        assert_eq!(finite_f32_from_f64(-1e300, 0.25), 0.25);
+        // Genuine non-finites still fall back.
+        assert_eq!(finite_f32_from_f64(f64::NAN, 0.5), 0.5);
+        assert_eq!(finite_f32_from_f64(f64::INFINITY, 0.5), 0.5);
+        // In-range values are untouched, including f32-subnormal magnitudes.
+        assert_eq!(finite_f32_from_f64(0.75, 0.0), 0.75);
+        // -3.0e38 is inside f32's range; -3.5e38 is NOT (f32::MAX ~ 3.4028e38)
+        // and correctly falls back, which is the same trap this test is about.
+        assert_eq!(finite_f32_from_f64(-3.0e38, 0.0), -3.0e38_f64 as f32);
+        assert_eq!(finite_f32_from_f64(-3.5e38, 0.25), 0.25);
+        assert!(finite_f32_from_f64(1e-45, 0.0).is_finite());
+        // A non-finite DEFAULT cannot launder one through either.
+        assert_eq!(finite_f32_from_f64(f64::NAN, 1e300), 0.0);
+        assert_eq!(finite_f32_from_f64(f64::NAN, f64::NEG_INFINITY), 0.0);
+    }
+
+    #[test]
+    fn the_eq_closure_narrows_exactly_like_eqd_so_q_vars_cannot_carry_inf() {
+        // `eq` is a closure over `self.eel_env`, so the shared narrowing helper is
+        // what is testable here — and it is the whole of `eq`'s body.
+        assert_eq!(
+            finite_f32_from_f64(1e300, 0.0),
+            0.0,
+            "the reviewer's q1 probe"
+        );
+        assert_eq!(finite_f32_from_f64(-1e300, 0.0), 0.0);
+        assert_eq!(finite_f32_from_f64(f64::INFINITY, 0.0), 0.0);
+        assert_eq!(finite_f32_from_f64(f64::NAN, 0.0), 0.0);
+        // Ordinary q values are untouched.
+        assert_eq!(finite_f32_from_f64(0.5, 0.0), 0.5);
+        assert_eq!(finite_f32_from_f64(-42.0, 0.0), -42.0);
+
+        // The two other casts in this file are bounded before narrowing, so they
+        // cannot carry this defect. Both are total over every finite input.
+        for t in [0.0f64, 1e300, -1e300, 86_400.0, f64::MAX] {
+            assert!(
+                shader_time_seconds(t).is_finite(),
+                "shader_time_seconds({t}) is not finite"
+            );
+            assert!(
+                shader_progress(t).is_finite(),
+                "shader_progress({t}) is not finite"
+            );
+        }
+    }
+
+    #[test]
+    fn public_audio_setters_cannot_admit_non_finite_or_unsafe_attenuation() {
+        for poison in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let v = audio_level_floor(poison);
+            assert!(v.is_finite() && v >= 0.0, "level {v} from {poison}");
+            let a = audio_att_floor(poison);
+            // `*_att` divides in preset equations, so zero is as bad as NaN.
+            assert!(a.is_finite() && a > 0.0, "att {a} from {poison}");
+        }
+        // Negative and zero attenuation are unsafe for the same reason.
+        assert_eq!(audio_level_floor(-5.0), 0.0);
+        assert_eq!(audio_level_floor(-0.0), 0.0);
+        assert_eq!(audio_att_floor(0.0), 1.0);
+        assert_eq!(audio_att_floor(-1.0), 1.0);
+
+        // Non-vacuity: ordinary values pass through bit-for-bit, so this is a floor
+        // and not a clamp that would change in-repo behaviour. Every in-repo caller
+        // arrives via `milkdrop_audio_rails`, whose output is finite and >= 0.001.
+        for v in [1.4f32, 1.1, 0.9, 1.2, 0.001, 3.0e38] {
+            assert_eq!(audio_level_floor(v), v);
+            assert_eq!(audio_att_floor(v), v);
+        }
+    }
+
+    /// Mechanism (b) + the consequence. With `bmin[0] = +inf` the range becomes
+    /// `NaN`, the blur-UBO guard catches its side, and the comp side — which was
+    /// unguarded — shipped `scale1 = NaN` into `comp_perframe_buf`.
+    #[test]
+    fn a_non_finite_blur_endpoint_no_longer_reaches_the_comp_uniforms() {
+        // What `eqd("b1n", …)` used to hand downstream for a per-frame b1n=1e300.
+        let poisoned = f32::INFINITY;
+        let (bmin, bmax) = blur_min_max_remap([poisoned, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        // Premise: the narrow-range branch does NOT fire, because `NaN < 0.1` is
+        // false, so the poisoned endpoint survives the remap untouched.
+        assert!(bmin[0].is_infinite(), "premise: bmin[0] stays +inf");
+        assert!(
+            (bmax[0] - bmin[0]).is_nan(),
+            "premise: the range is NaN, not zero"
+        );
+
+        // The blur UBO was already clean — that half was never the defect.
+        let (raw_scale, raw_bias) = blur_scale_and_bias(bmin, bmax);
+        let (scale, bias) = guard_finite_blur_scale_bias(raw_scale, raw_bias);
+        for lvl in 0..3 {
+            assert!(scale[lvl].is_finite() && bias[lvl].is_finite());
+        }
+
+        // The comp side is what leaked. Unguarded first, to prove non-vacuity:
+        let comp_scale_raw = [bmax[0] - bmin[0], bmax[1] - bmin[1], bmax[2] - bmin[2]];
+        assert!(
+            comp_scale_raw[0].is_nan(),
+            "premise: the unguarded comp scale1 is NaN"
+        );
+
+        let (cmin, cmax, cscale, cbias) =
+            guard_finite_comp_blur(bmin, bmax, comp_scale_raw, [bmin[0], bmin[1], bmin[2]]);
+        for lvl in 0..3 {
+            assert!(
+                cmin[lvl].is_finite()
+                    && cmax[lvl].is_finite()
+                    && cscale[lvl].is_finite()
+                    && cbias[lvl].is_finite(),
+                "comp level {lvl} still non-finite: min {} max {} scale {} bias {}",
+                cmin[lvl],
+                cmax[lvl],
+                cscale[lvl],
+                cbias[lvl]
+            );
+        }
+        // The poisoned level is reset to the identity range as a group.
+        assert_eq!(
+            (cmin[0], cmax[0], cscale[0], cbias[0]),
+            (0.0, 1.0, 1.0, 0.0)
+        );
+    }
+
+    /// THE case `guard_finite_comp_blur` exists for, and the one no ingress guard
+    /// can close: two **finite** endpoints whose **subtraction** overflows `f32`.
+    /// Both values pass `parse_finite_f32` and `finite_f32_from_f64`; the overflow
+    /// is a property of the pair, not of either value. Found by review 2026-08-15
+    /// when it disproved this guard's original justification.
+    #[test]
+    fn two_finite_endpoints_whose_difference_overflows_are_still_caught() {
+        let (bmin_in, bmax_in) = ([-3.0e38f32, 0.0, 0.0], [3.0e38f32, 1.0, 1.0]);
+        // Premise: both endpoints are finite and would survive every ingress guard.
+        assert!(bmin_in[0].is_finite() && bmax_in[0].is_finite());
+        assert_eq!(finite_f32_from_f64(-3.0e38, 0.0), bmin_in[0]);
+        assert_eq!(finite_f32_from_f64(3.0e38, 0.0), bmax_in[0]);
+
+        let (bmin, bmax) = blur_min_max_remap(bmin_in, bmax_in);
+        // Premise: the narrow-range branch does NOT fire — the range is enormous,
+        // not narrow — so the endpoints arrive at the comp side untouched.
+        assert_eq!(bmin[0], bmin_in[0]);
+        assert_eq!(bmax[0], bmax_in[0]);
+        let comp_scale_raw = [bmax[0] - bmin[0], bmax[1] - bmin[1], bmax[2] - bmin[2]];
+        assert!(
+            comp_scale_raw[0].is_infinite(),
+            "premise: the subtraction overflows, got {}",
+            comp_scale_raw[0]
+        );
+
+        let (cmin, cmax, cscale, cbias) =
+            guard_finite_comp_blur(bmin, bmax, comp_scale_raw, [bmin[0], bmin[1], bmin[2]]);
+        assert_eq!(
+            (cmin[0], cmax[0], cscale[0], cbias[0]),
+            (0.0, 1.0, 1.0, 0.0),
+            "only this guard resets the overflowing level"
+        );
+        for lvl in 0..3 {
+            assert!(cscale[lvl].is_finite() && cbias[lvl].is_finite());
+        }
+    }
+
+    /// Non-vacuity for the comp guard: an ordinary preset is bit-identical to
+    /// pre-change, and a level is only reset when one of its four is non-finite.
+    #[test]
+    fn comp_blur_guard_leaves_finite_levels_exactly_as_authored() {
+        let (bmin, bmax) = blur_min_max_remap([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        let scale = [bmax[0] - bmin[0], bmax[1] - bmin[1], bmax[2] - bmin[2]];
+        let bias = [bmin[0], bmin[1], bmin[2]];
+        let (cmin, cmax, cscale, cbias) = guard_finite_comp_blur(bmin, bmax, scale, bias);
+        assert_eq!((cmin, cmax, cscale, cbias), (bmin, bmax, scale, bias));
+
+        // Only the offending level is touched; the other two survive verbatim.
+        let (cmin, cmax, cscale, cbias) = guard_finite_comp_blur(
+            [0.1, 0.2, 0.3],
+            [0.9, 0.8, 0.7],
+            [0.8, f32::NAN, 0.4],
+            [0.1, 0.2, 0.3],
+        );
+        assert_eq!(
+            (cmin[0], cmax[0], cscale[0], cbias[0]),
+            (0.1, 0.9, 0.8, 0.1)
+        );
+        assert_eq!(
+            (cmin[1], cmax[1], cscale[1], cbias[1]),
+            (0.0, 1.0, 1.0, 0.0)
+        );
+        assert_eq!(
+            (cmin[2], cmax[2], cscale[2], cbias[2]),
+            (0.3, 0.7, 0.4, 0.3)
+        );
+    }
+
+    #[test]
+    fn blur_guard_keeps_every_value_written_to_the_blur_ubo_finite() {
+        for (bmin_in, bmax_in, label) in [
+            (
+                [0.0f32, 0.0, 0.0],
+                [0.0f32, 0.0, 0.0],
+                "all-zero (NaN form)",
+            ),
+            (
+                [0.0f32, 0.5, 0.0],
+                [1.0f32, 0.5, 1.0],
+                "narrow level 2 (Inf form)",
+            ),
+            (
+                [0.2f32, 0.2, 0.2],
+                [0.25f32, 0.9, 0.9],
+                "narrow level 1 only",
+            ),
+            (
+                [-1.0f32, -1.0, -1.0],
+                [-1.0f32, -1.0, -1.0],
+                "negative all-equal",
+            ),
+        ] {
+            let (bmin, bmax) = blur_min_max_remap(bmin_in, bmax_in);
+            let (raw_scale, raw_bias) = blur_scale_and_bias(bmin, bmax);
+            let (scale, bias) = guard_finite_blur_scale_bias(raw_scale, raw_bias);
+            for lvl in 0..3 {
+                assert!(
+                    scale[lvl].is_finite(),
+                    "{label}: scale[{lvl}] reached the UBO as {} (raw {})",
+                    scale[lvl],
+                    raw_scale[lvl]
+                );
+                assert!(
+                    bias[lvl].is_finite(),
+                    "{label}: bias[{lvl}] reached the UBO as {} (raw {})",
+                    bias[lvl],
+                    raw_bias[lvl]
+                );
+                // Pair semantics: a substituted level is the identity transform, so the
+                // shader's `b = b * scale + bias` passes the level through unremapped.
+                if !raw_scale[lvl].is_finite() || !raw_bias[lvl].is_finite() {
+                    assert_eq!(scale[lvl], 1.0, "{label}: level {lvl} scale not identity");
+                    assert_eq!(bias[lvl], 0.0, "{label}: level {lvl} bias not identity");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blur_guard_preserves_finite_scale_bias_including_large_magnitudes() {
+        // Default blur range: both halves are identity, nothing is substituted.
+        let (bmin, bmax) = blur_min_max_remap([0.0, 0.0, 0.0], [1.0, 1.0, 1.0]);
+        let (raw_scale, raw_bias) = blur_scale_and_bias(bmin, bmax);
+        let (scale, bias) = guard_finite_blur_scale_bias(raw_scale, raw_bias);
+        assert_eq!(scale, raw_scale);
+        assert_eq!(bias, raw_bias);
+        assert_eq!(scale, [1.0, 1.0, 1.0]);
+        assert_eq!(bias, [0.0, 0.0, 0.0]);
+
+        // Magnitude is NOT policy: a huge-but-finite scale passes through untouched.
+        let huge = [1.0e30f32, -1.0e30, 1.0e-30];
+        let (scale, bias) = guard_finite_blur_scale_bias(huge, huge);
+        assert_eq!(scale, huge);
+        assert_eq!(bias, huge);
+
+        // Pair granularity: a finite scale beside a non-finite bias resets BOTH, because
+        // keeping the scale and zeroing the bias is an arbitrary third transform.
+        let (scale, bias) =
+            guard_finite_blur_scale_bias([4.0, 1.0, 1.0], [f32::NAN, 0.25, f32::INFINITY]);
+        assert_eq!(scale, [1.0, 1.0, 1.0]);
+        assert_eq!(bias, [0.0, 0.25, 0.0]);
+    }
 
     #[test]
     fn preset_setup_audio_matches_butterchurn_audio_levels() {
@@ -8901,6 +10386,50 @@ mod tests {
     }
 
     #[test]
+    fn shared_feedback_blends_evaluated_opposite_translations_without_non_finite_values() {
+        let mut outgoing = [
+            WarpVert {
+                pos: [-1.0, -1.0],
+                uv: [0.25, 0.75],
+                decay: [0.8, 0.6, 0.4, 1.0],
+            },
+            WarpVert {
+                pos: [1.0, 1.0],
+                uv: [0.75, 0.25],
+                decay: [0.4, 0.6, 0.8, 1.0],
+            },
+        ];
+        let incoming = [
+            WarpVert {
+                pos: [-1.0, -1.0],
+                uv: [0.75, 0.25],
+                decay: [0.2, 0.4, 0.6, 1.0],
+            },
+            WarpVert {
+                pos: [1.0, 1.0],
+                uv: [0.25, 0.75],
+                decay: [0.6, 0.4, 0.2, 1.0],
+            },
+        ];
+
+        assert!(blend_evaluated_warp_mesh(&mut outgoing, &incoming, 0.5));
+        assert_eq!(outgoing[0].uv, [0.5, 0.5]);
+        assert_eq!(outgoing[1].uv, [0.5, 0.5]);
+        assert_eq!(outgoing[0].decay, [0.5, 0.5, 0.5, 1.0]);
+        assert!(outgoing
+            .iter()
+            .flat_map(|vertex| vertex.uv.iter().chain(vertex.decay.iter()))
+            .all(|value| value.is_finite()));
+
+        let before_invalid_progress = (outgoing[0].uv, outgoing[0].decay, outgoing[1].uv, outgoing[1].decay);
+        assert!(!blend_evaluated_warp_mesh(&mut outgoing, &incoming, f32::NAN));
+        assert_eq!(
+            (outgoing[0].uv, outgoing[0].decay, outgoing[1].uv, outgoing[1].decay),
+            before_invalid_progress
+        );
+    }
+
+    #[test]
     fn canonical_mesh_and_blur_geometry_match_butterchurn() {
         assert_eq!((GRID_W, GRID_H), (48, 36));
         assert_eq!((COMP_GRID_W, COMP_GRID_H), (32, 24));
@@ -9061,7 +10590,6 @@ mod tests {
         );
     }
 
-    // ── P2-VIS-016: the dead legacy warp compiler/pipeline is gone ───────────────
     #[test]
     fn legacy_warp_compile_is_gone_and_live_warp_path_survives() {
         let compiled = compile_milkdrop_shader_bodies_from_parts(
@@ -9070,9 +10598,6 @@ mod tests {
             None,
         )
         .expect("live warp/comp paths must still compile");
-        // Before P2-VIS-016 this held compiled legacy fullscreen-warp WGSL, and a
-        // legacy-only compile failure could reject an otherwise-renderable preset.
-        // The legacy path is removed, so no legacy WGSL is produced.
         assert!(
             compiled.warp_wgsl.is_empty(),
             "legacy warp WGSL must no longer be produced"
@@ -9082,7 +10607,6 @@ mod tests {
         assert!(!compiled.comp_wgsl.is_empty());
     }
 
-    // ── P2-VIS-017: only sampled blur levels are needed ─────────────────────────
     #[test]
     fn needed_blur_levels_tracks_highest_sampled_level() {
         assert_eq!(needed_blur_levels(None, None), 0);
@@ -9102,13 +10626,6 @@ mod tests {
         );
     }
 
-    // ── P2-VIS-017 hardening: mode-prefixed blur samplers must be detected ───────
-    //
-    // The preprocessor collapses `sampler_{fw,fc,pw,pc}_blurN` → `sampler_blurN`
-    // before compile, so a body sampling e.g. `sampler_pw_blur2` DOES read blur2 at
-    // runtime. Before running the detector through that same normalization, this
-    // under-detected (returned 0) and the sampled level was never generated →
-    // stale/black blur texture. Each mode prefix is exercised below.
     #[test]
     fn needed_blur_levels_detects_mode_prefixed_samplers() {
         // pw-prefixed blur2 in a comp body → level 2 (regression: was 0).
@@ -9138,7 +10655,6 @@ mod tests {
         assert_eq!(needed_blur_levels(Some("ret = GetBlur3(uv);"), None), 3);
     }
 
-    // ── P2-VIS-019: external dimensions are validated with checked arithmetic ────
     #[test]
     fn validate_texture_dims_accepts_reasonable_and_rejects_extremes() {
         // Ordinary and exactly-at-max dimensions are accepted.
@@ -9164,6 +10680,64 @@ mod tests {
             validate_texture_dims(u32::MAX, u32::MAX, u32::MAX),
             Err(DimensionError::ArithmeticOverflow)
         ));
+    }
+
+    // Texture-dimension boundary: the existing test probes values far
+    // outside the caps (100_000 against a max of 8192). Pin the exact
+    // edges so an off-by-one in either comparison is caught, and cover
+    // the single-axis degenerate cases.
+    #[test]
+    fn validate_texture_dims_boundaries_are_exact() {
+        const MAX: u32 = 16384;
+
+        // max - 1, max: accepted. max + 1: the first rejection, and the
+        // typed error carries the offending pair plus the cap.
+        assert!(validate_texture_dims(MAX, MAX - 1, MAX - 1).is_ok());
+        assert!(validate_texture_dims(MAX, MAX, MAX).is_ok());
+        match validate_texture_dims(MAX, MAX + 1, 16) {
+            Err(DimensionError::ExceedsMaxTextureDimension { width, height, max }) => {
+                assert_eq!((width, height, max), (MAX + 1, 16, MAX));
+            }
+            other => panic!("expected ExceedsMaxTextureDimension at max + 1, got {other:?}"),
+        }
+        // Either axis alone is enough to trip it.
+        assert!(matches!(
+            validate_texture_dims(MAX, 16, MAX + 1),
+            Err(DimensionError::ExceedsMaxTextureDimension { .. })
+        ));
+
+        // One pixel is legal; zero on EITHER axis is not (the existing
+        // test only covers a zero width).
+        assert!(validate_texture_dims(MAX, 1, 1).is_ok());
+        assert_eq!(
+            validate_texture_dims(MAX, 1280, 0),
+            Err(DimensionError::Zero)
+        );
+        assert_eq!(validate_texture_dims(MAX, 0, 0), Err(DimensionError::Zero));
+
+        // u32::MAX on one axis is refused by the dimension cap, before any
+        // of the byte arithmetic runs.
+        assert!(matches!(
+            validate_texture_dims(MAX, u32::MAX, 1),
+            Err(DimensionError::ExceedsMaxTextureDimension { .. })
+        ));
+
+        // Memory-budget edge, isolated from the dimension cap by a
+        // permissive max: total = w * h * 4 * TEXTURE_FOOTPRINT_MULTIPLIER.
+        let max_pixels =
+            super::MAX_TEXTURE_MEMORY_BYTES / (4 * super::TEXTURE_FOOTPRINT_MULTIPLIER);
+        let at_budget = u32::try_from(max_pixels).expect("budget edge fits in u32");
+        assert!(
+            validate_texture_dims(u32::MAX, at_budget, 1).is_ok(),
+            "a footprint landing exactly on the memory budget must be accepted"
+        );
+        match validate_texture_dims(u32::MAX, at_budget + 1, 1) {
+            Err(DimensionError::ExceedsMemoryBudget { bytes, budget }) => {
+                assert_eq!(budget, super::MAX_TEXTURE_MEMORY_BYTES);
+                assert!(bytes > super::MAX_TEXTURE_MEMORY_BYTES);
+            }
+            other => panic!("expected ExceedsMemoryBudget one pixel past the edge, got {other:?}"),
+        }
     }
 
     // ── GPU-backed regressions (need a real adapter; skipped if none) ───────────
@@ -9211,6 +10785,508 @@ mod tests {
                 view_formats: &[],
             })
             .create_view(&Default::default())
+    }
+
+    #[cfg(feature = "app")]
+    fn seed_asymmetric_feedback(renderer: &mut MilkdropRenderer) {
+        let width = renderer.render_w;
+        let height = renderer.render_h;
+        let mut pixels = vec![0u8; (width * height * 4) as usize];
+        for y in 0..height {
+            for x in 0..width {
+                let pixel = ((y * width + x) * 4) as usize;
+                // The off-centre L shape makes a horizontal translation
+                // distinguishable from a dissolve or a uniform black page.
+                let left_bar = x > width / 8 && x < width / 4 && y > height / 5;
+                let top_bar = y > height / 6 && y < height / 3 && x < width * 3 / 4;
+                if left_bar || top_bar {
+                    pixels[pixel] = 220;
+                    pixels[pixel + 1] = if top_bar { 80 } else { 20 };
+                    pixels[pixel + 2] = if left_bar { 180 } else { 30 };
+                    pixels[pixel + 3] = 255;
+                }
+            }
+        }
+        let extent = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        for texture in [&renderer.tex_a, &renderer.tex_b] {
+            renderer.queue.write_texture(
+                texture.as_image_copy(),
+                &pixels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(width * 4),
+                    rows_per_image: Some(height),
+                },
+                extent,
+            );
+        }
+        let mut encoder = renderer
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("shared-feedback-asymmetric-seed"),
+            });
+        super::generate_mip_chain(
+            &renderer.device,
+            &renderer.feedback_mip_blitter,
+            &mut encoder,
+            &renderer.feedback_mips_a,
+        );
+        super::generate_mip_chain(
+            &renderer.device,
+            &renderer.feedback_mip_blitter,
+            &mut encoder,
+            &renderer.feedback_mips_b,
+        );
+        renderer.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn shared_feedback_mid_morph_has_visible_asymmetric_pixels_and_advances_both_states() {
+        let (device, queue) = gpu_device().expect(
+            "shared-feedback regression requires a real wgpu adapter; do not treat a missing adapter as success",
+        );
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let outgoing_preset = crate::parse_milk::parse(
+            "fWaveAlpha=0\n\
+             bMotionVectorsOn=0\n\
+             per_frame_1=dx=0.125;reg00=reg00+1;\n",
+        );
+        let incoming_preset = crate::parse_milk::parse(
+            "fWaveAlpha=0\n\
+             bMotionVectorsOn=0\n\
+             fGammaAdj=3\n\
+             per_frame_1=dx=-0.125;reg00=reg00+2;\n",
+        );
+        let target_view = offscreen_target(&device, 64, 64, format);
+        // Match the runtime build worker: each renderer receives a fresh Arc
+        // around a clone of the same wgpu device/queue, rather than `Arc::clone`
+        // of one wrapper. `wgpu::Device` equality must retain this pair.
+        let mut outgoing = MilkdropRenderer::new(
+            std::sync::Arc::new(device.as_ref().clone()),
+            std::sync::Arc::new(queue.as_ref().clone()),
+            64,
+            64,
+            format,
+            &outgoing_preset,
+        )
+        .expect("outgoing renderer");
+        let mut incoming = MilkdropRenderer::new(
+            std::sync::Arc::new(device.as_ref().clone()),
+            std::sync::Arc::new(queue.as_ref().clone()),
+            64,
+            64,
+            format,
+            &incoming_preset,
+        )
+        .expect("incoming renderer");
+        assert!(outgoing.supports_shared_feedback(&incoming));
+        assert_eq!(
+            outgoing.shared_feedback_support(&incoming),
+            super::SharedFeedbackSupport::FeedbackOnlyInterpolatedComp
+        );
+        let overlay_preset = crate::parse_milk::parse("fWaveAlpha=0.25\nbMotionVectorsOn=0\n");
+        let overlay_renderer = MilkdropRenderer::new(
+            device.clone(),
+            incoming.queue.clone(),
+            64,
+            64,
+            format,
+            &overlay_preset,
+        )
+        .expect("overlay-bearing renderer");
+        assert_eq!(
+            outgoing.shared_feedback_support(&overlay_renderer),
+            super::SharedFeedbackSupport::UntexturedOverlaysInterpolatedComp,
+            "compatible waves must fade in the shared overlay pass rather than pop on promotion"
+        );
+        let hue_shader_preset = crate::parse_milk::parse(
+            "fWaveAlpha=0\n\
+             bMotionVectorsOn=0\n\
+             fShader=1\n",
+        );
+        let hue_shader_renderer = MilkdropRenderer::new(
+            std::sync::Arc::new(device.as_ref().clone()),
+            std::sync::Arc::new(queue.as_ref().clone()),
+            64,
+            64,
+            format,
+            &hue_shader_preset,
+        )
+        .expect("hue-shader renderer");
+        assert_eq!(
+            outgoing.shared_feedback_support(&hue_shader_renderer),
+            super::SharedFeedbackSupport::DiscreteCompUnsupported,
+            "fShader must use fallback because outgoing rand_start hue would pop at promotion"
+        );
+
+        seed_asymmetric_feedback(&mut outgoing);
+        assert!(incoming.seed_feedback_from(&outgoing));
+        outgoing.set_geometry_diagnostics_enabled(true);
+        let before_invalid = (outgoing.frame_idx, incoming.frame_idx);
+        assert!(
+            !outgoing.render_shared_feedback(&target_view, f32::NAN, &mut incoming),
+            "non-finite progress must select the caller fallback without advancing either state"
+        );
+        assert_eq!((outgoing.frame_idx, incoming.frame_idx), before_invalid);
+
+        assert!(
+            outgoing.render_shared_feedback(&target_view, 0.5, &mut incoming),
+            "the p=0.5 frame must use the evaluated UV blend before feedback sampling"
+        );
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("GPU poll after shared feedback render");
+        let post_warp = outgoing
+            .geometry_stage_images()
+            .expect("diagnostics enabled before shared-feedback render")
+            .post_warp_rgba;
+        assert!(
+            post_warp.chunks_exact(4).any(|pixel| pixel[0] > 24 || pixel[2] > 24),
+            "asymmetric seeded feedback must remain visibly populated before progress reaches 1"
+        );
+        assert!(
+            post_warp
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] != pixel[2]),
+            "the mid-morph must preserve asymmetric seeded colour evidence"
+        );
+        assert_eq!(outgoing.frame_idx, 1);
+        assert_eq!(incoming.frame_idx, 1);
+        assert!(
+            (outgoing.last_comp_perframe.gamma_adj - 2.5).abs() < 1.0e-6,
+            "the visible built-in comp pass must interpolate outgoing/incoming gamma"
+        );
+        assert_ne!(
+            outgoing.eel_env.get("reg00").copied(),
+            incoming.eel_env.get("reg00").copied(),
+            "outgoing and incoming equation states must advance independently"
+        );
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn shared_feedback_blends_untextured_builtin_wave_overlays_before_completion() {
+        let (device, queue) = gpu_device().expect(
+            "shared overlay regression requires a real wgpu adapter; do not treat a missing adapter as success",
+        );
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let outgoing_preset = crate::parse_milk::parse(
+            "fWaveAlpha=1\n\
+             wave_r=1\n\
+             wave_g=0\n\
+             wave_b=0\n\
+             bMotionVectorsOn=0\n",
+        );
+        let incoming_preset = crate::parse_milk::parse(
+            "fWaveAlpha=1\n\
+             wave_r=0\n\
+             wave_g=0\n\
+             wave_b=1\n\
+             bMotionVectorsOn=0\n",
+        );
+        let target_view = offscreen_target(&device, 64, 64, format);
+        let mut outgoing = MilkdropRenderer::new(
+            std::sync::Arc::new(device.as_ref().clone()),
+            std::sync::Arc::new(queue.as_ref().clone()),
+            64,
+            64,
+            format,
+            &outgoing_preset,
+        )
+        .expect("outgoing overlay renderer");
+        let mut incoming = MilkdropRenderer::new(
+            std::sync::Arc::new(device.as_ref().clone()),
+            std::sync::Arc::new(queue.as_ref().clone()),
+            64,
+            64,
+            format,
+            &incoming_preset,
+        )
+        .expect("incoming overlay renderer");
+        assert_eq!(
+            outgoing.shared_feedback_support(&incoming),
+            super::SharedFeedbackSupport::UntexturedOverlaysInterpolatedComp
+        );
+
+        let left: Vec<f32> = (0..512)
+            .map(|index| (index as f32 * 2.0 * std::f32::consts::PI * 7.0 / 512.0).sin())
+            .collect();
+        let right: Vec<f32> = (0..512)
+            .map(|index| (index as f32 * 2.0 * std::f32::consts::PI * 11.0 / 512.0).sin())
+            .collect();
+        outgoing.set_waveform(&left, &right);
+        outgoing.set_geometry_diagnostics_enabled(true);
+        assert!(
+            outgoing.render_shared_feedback(&target_view, 0.5, &mut incoming),
+            "the compatible overlay pair must use the shared renderer path"
+        );
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("GPU poll after shared overlay render");
+        let post_overlays = outgoing
+            .geometry_stage_images()
+            .expect("diagnostics enabled before shared overlay render")
+            .post_overlays_rgba;
+        assert!(
+            post_overlays
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] > 20 && pixel[2] > 20),
+            "p=0.5 must show both outgoing red and incoming blue waveform overlays before promotion"
+        );
+        assert_eq!(outgoing.frame_idx, 1);
+        assert_eq!(incoming.frame_idx, 1);
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn shared_feedback_blends_untextured_static_shape_overlays_before_completion() {
+        let (device, queue) = gpu_device().expect(
+            "shared shape-overlay regression requires a real wgpu adapter; do not treat a missing adapter as success",
+        );
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let outgoing_preset = crate::parse_milk::parse(
+            "fWaveAlpha=0\n\
+             bMotionVectorsOn=0\n\
+             shapecode_0_enabled=1\n\
+             shapecode_0_sides=4\n\
+             shapecode_0_x=0.5\n\
+             shapecode_0_y=0.5\n\
+             shapecode_0_rad=0.35\n\
+             shapecode_0_r=1\n\
+             shapecode_0_g=0\n\
+             shapecode_0_b=0\n\
+             shapecode_0_a=1\n\
+             shapecode_0_r2=1\n\
+             shapecode_0_g2=0\n\
+             shapecode_0_b2=0\n\
+             shapecode_0_a2=1\n\
+             shapecode_0_border_a=0\n",
+        );
+        let incoming_preset = crate::parse_milk::parse(
+            "fWaveAlpha=0\n\
+             bMotionVectorsOn=0\n\
+             shapecode_0_enabled=1\n\
+             shapecode_0_sides=4\n\
+             shapecode_0_x=0.5\n\
+             shapecode_0_y=0.5\n\
+             shapecode_0_rad=0.35\n\
+             shapecode_0_r=0\n\
+             shapecode_0_g=0\n\
+             shapecode_0_b=1\n\
+             shapecode_0_a=1\n\
+             shapecode_0_r2=0\n\
+             shapecode_0_g2=0\n\
+             shapecode_0_b2=1\n\
+             shapecode_0_a2=1\n\
+             shapecode_0_border_a=0\n",
+        );
+        let target_view = offscreen_target(&device, 64, 64, format);
+        let mut outgoing = MilkdropRenderer::new(
+            std::sync::Arc::new(device.as_ref().clone()),
+            std::sync::Arc::new(queue.as_ref().clone()),
+            64,
+            64,
+            format,
+            &outgoing_preset,
+        )
+        .expect("outgoing shape renderer");
+        let mut incoming = MilkdropRenderer::new(
+            std::sync::Arc::new(device.as_ref().clone()),
+            std::sync::Arc::new(queue.as_ref().clone()),
+            64,
+            64,
+            format,
+            &incoming_preset,
+        )
+        .expect("incoming shape renderer");
+        assert_eq!(
+            outgoing.shared_feedback_support(&incoming),
+            super::SharedFeedbackSupport::UntexturedOverlaysInterpolatedComp
+        );
+
+        outgoing.set_geometry_diagnostics_enabled(true);
+        assert!(outgoing.render_shared_feedback(&target_view, 0.5, &mut incoming));
+        device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("GPU poll after shared shape-overlay render");
+        assert!(outgoing.scratch.shape_fill_draws.iter().any(|draw| draw.sides == 4));
+        let post_overlays = outgoing
+            .geometry_stage_images()
+            .expect("diagnostics enabled before shared shape-overlay render")
+            .post_overlays_rgba;
+        assert!(
+            post_overlays
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] > 20 && pixel[2] > 20),
+            "p=0.5 must show both outgoing red and incoming blue untextured shapes before promotion"
+        );
+
+        let textured = crate::parse_milk::parse(
+            "fWaveAlpha=0\n\
+             bMotionVectorsOn=0\n\
+             shapecode_0_enabled=1\n\
+             shapecode_0_textured=1\n",
+        );
+        let textured_renderer = MilkdropRenderer::new(
+            std::sync::Arc::new(device.as_ref().clone()),
+            std::sync::Arc::new(queue.as_ref().clone()),
+            64,
+            64,
+            format,
+            &textured,
+        )
+        .expect("textured shape renderer");
+        assert_eq!(
+            outgoing.shared_feedback_support(&textured_renderer),
+            super::SharedFeedbackSupport::VisibleOverlaysUnsupported,
+            "textured shapes must retain the caller fallback instead of sampling a renderer-local page"
+        );
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn beatdrop_feedback_places_vectors_in_history_before_warp() {
+        let (device, queue) = gpu_device().expect("feedback provenance requires a real GPU");
+        let preset = crate::parse_milk::parse(
+            "fWaveAlpha=0\nbMotionVectorsOn=1\nnMotionVectorsX=4\nnMotionVectorsY=4\nmv_a=1\ndx=0.125\n",
+        );
+        let target = offscreen_target(&device, 64, 64, wgpu::TextureFormat::Rgba8Unorm);
+        let mut legacy = MilkdropRenderer::new(
+            device.clone(), queue.clone(), 64, 64, wgpu::TextureFormat::Rgba8Unorm, &preset,
+        ).unwrap();
+        let mut compatible = MilkdropRenderer::new(
+            device.clone(), queue, 64, 64, wgpu::TextureFormat::Rgba8Unorm, &preset,
+        ).unwrap();
+        assert_eq!(legacy.feedback_provenance(), super::FeedbackProvenance::Legacy);
+        compatible.set_beatdrop_feedback(true);
+        // Exercise the previous-history blur branch even with a default COMP.
+        legacy.blur_levels = 1;
+        compatible.blur_levels = 1;
+        legacy.set_geometry_diagnostics_enabled(true);
+        compatible.set_geometry_diagnostics_enabled(true);
+        legacy.render(&target);
+        compatible.render(&target);
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let legacy = legacy.geometry_stage_images().unwrap();
+        let compatible = compatible.geometry_stage_images().unwrap();
+        let has_color = |bytes: &[u8]| bytes.chunks_exact(4).any(|pixel|
+            pixel[0] > 8 || pixel[1] > 8 || pixel[2] > 8);
+        assert!(!has_color(&legacy.post_warp_rgba), "legacy vectors arrive after warp");
+        assert!(has_color(&legacy.post_overlays_rgba), "the legacy vector draw must be non-vacuous");
+        assert!(has_color(&compatible.post_warp_rgba), "compatible warp must sample this frame's vectors");
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn mode8_uses_bounded_pcm_stereo_spectrum_without_enhanced_shader_helpers() {
+        let (device, queue) = gpu_device().expect(
+            "mode-8 audio regression requires a real wgpu adapter; do not treat a missing adapter as success",
+        );
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let preset = crate::parse_milk::parse(
+            "nWaveMode=8\n\
+             fWaveAlpha=1\n\
+             wave_r=1\n\
+             wave_g=0\n\
+             wave_b=0\n\
+             bMotionVectorsOn=0\n",
+        );
+        let target = offscreen_target(&device, 64, 64, format);
+        let mut renderer = MilkdropRenderer::new(device, queue, 64, 64, format, &preset)
+            .expect("mode-8 renderer");
+        assert!(
+            !renderer.enhanced_audio_enabled,
+            "the preset has no helper calls: this covers the mode-8-only DSP path"
+        );
+
+        // Deliberately distinguish the channels: the bounded in-renderer FFT is
+        // allowed to compute them, whereas the legacy mono `freqArray` is not.
+        let left: Vec<f32> = (0..1024)
+            .map(|index| (index as f32 * 2.0 * std::f32::consts::PI * 19.0 / 1024.0).sin())
+            .collect();
+        let right: Vec<f32> = (0..1024)
+            .map(|index| (index as f32 * 2.0 * std::f32::consts::PI * 47.0 / 1024.0).sin() * 0.5)
+            .collect();
+        renderer.set_waveform(&left, &right);
+        renderer.set_enhanced_audio(
+            None,
+            None,
+            &left,
+            &right,
+            48_000.0,
+            1.0 / 60.0,
+            EnhancedAudioConfig::default(),
+        );
+        assert_eq!(renderer.freq_spectrum.len(), ENHANCED_FFT_BINS);
+        assert_eq!(renderer.freq_spectrum_right.len(), ENHANCED_FFT_BINS);
+        assert!(
+            renderer
+                .freq_spectrum
+                .iter()
+                .zip(&renderer.freq_spectrum_right)
+                .any(|(left, right)| (left - right).abs() > 1.0e-4),
+            "mode 8 must receive independent raw PCM magnitudes, not a copied mono row"
+        );
+
+        renderer.set_geometry_diagnostics_enabled(true);
+        renderer.render(&target);
+        renderer
+            .device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("GPU poll after mode-8 render");
+        assert!(
+            renderer.scratch.wave_draws.iter().any(|draw| draw.count > 1),
+            "mode 8 must emit a drawable built-in waveform after its PCM FFT"
+        );
+        assert!(renderer
+            .scratch
+            .wave_verts
+            .iter()
+            .all(|vertex| vertex.pos.iter().chain(vertex.color.iter()).all(|value| value.is_finite())));
+        let overlays = renderer
+            .geometry_stage_images()
+            .expect("diagnostics enabled before mode-8 rendering")
+            .post_overlays_rgba;
+        assert!(
+            overlays.chunks_exact(4).any(|pixel| pixel[0] > 16),
+            "the GPU overlay checkpoint must contain the mode-8 waveform"
+        );
+    }
+
+    #[cfg(feature = "app")]
+    #[test]
+    fn reduced_profiles_render_to_hdr_without_validation_errors() {
+        let Some((device, queue)) = gpu_device() else {
+            return;
+        };
+        let format = wgpu::TextureFormat::Rgba16Float;
+        let preset = crate::parse_milk::parse("");
+        let target = offscreen_target(&device, 64, 64, format);
+        let mut renderer = MilkdropRenderer::new(device.clone(), queue, 64, 64, format, &preset)
+            .expect("HDR renderer");
+
+        for profile in [
+            MilkdropPerformanceProfile::High60,
+            MilkdropPerformanceProfile::Balanced60,
+            MilkdropPerformanceProfile::Rescue60,
+        ] {
+            let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            renderer.set_performance_profile(profile);
+            renderer.render(&target);
+            device
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("GPU poll");
+            let error = pollster::block_on(scope.pop());
+            assert!(
+                error.is_none(),
+                "{profile:?} raised an HDR validation error: {error:?}"
+            );
+        }
     }
 
     #[cfg(feature = "app")]
@@ -9317,7 +11393,6 @@ mod tests {
             .expect("GPU poll");
     }
 
-    // ── P2-VIS-017: blur draws scale with the sampled levels ────────────────────
     #[cfg(feature = "app")]
     #[test]
     fn blur_passes_scale_with_sampled_levels() {
@@ -9346,7 +11421,6 @@ mod tests {
         assert_eq!(r2.last_blur_pass_count(), 4);
     }
 
-    // ── P2-VIS-032: shapes render with no ShapeU uniform/binding ────────────────
     #[cfg(feature = "app")]
     #[test]
     fn shapes_render_without_shapeu_binding() {
@@ -9375,7 +11449,6 @@ mod tests {
         );
     }
 
-    // ── P2-VIS-019: over-limit dimensions are rejected before allocation ────────
     #[cfg(feature = "app")]
     #[test]
     fn renderer_rejects_oversized_dimensions_without_allocating() {
@@ -9413,7 +11486,6 @@ mod tests {
             .expect("valid resize must still work");
     }
 
-    // ── P2-VIS-031: FFT + waveform resample INDEPENDENTLY (no length fallback) ───
     #[test]
     fn resample_linear_adapts_length_without_collapsing() {
         // Identity when lengths already match.
@@ -9458,8 +11530,6 @@ mod tests {
         assert!(scratch.iter().all(|value| (*value - 0.25).abs() < 1e-6));
     }
 
-    // ── P2-VIS-031: a spectrum custom wave uses the FFT even when its length
-    //    differs from the PCM length (was a silent time-domain fallback) ─────────
     #[cfg(feature = "app")]
     #[test]
     fn spectrum_wave_uses_fft_independent_of_pcm_length() {
@@ -9499,7 +11569,6 @@ mod tests {
         );
     }
 
-    // ── P2-VIS-018: absurd instance/segment counts are bounded to the caps ──────
     #[cfg(feature = "app")]
     #[test]
     fn absurd_shape_instance_count_is_bounded_to_the_vertex_cap() {

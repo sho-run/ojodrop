@@ -42,6 +42,51 @@ interpret presets is a little fuzzy, so I made some middle-of-the-road decisions
 I may iterate more to get the fidelity rate up, but there will be diminishing returns unless
 I found a couple of slam dunk levers to move the needle.
 
+## Update — September 12, 2026
+
+This source update expands preset compatibility and improves resilience while
+keeping the classic rendering and audio behavior as the default.
+
+- **More waveform options:** 18 base waveform modes (0–17), including the
+  BeatDrop-derived extended modes, plus up to 16 custom wave slots and 16 custom
+  shape slots. Sparse slot numbers are preserved and oversized inputs are bounded.
+- **Richer shader audio:** opt-in `get_fft`, `get_fft_hz`, `get_fft_peak`,
+  `get_fft_peak_hz`, `get_wave`, `get_wave_left`, and `get_wave_right` helpers.
+  Presets can use smoothed spectra, peak history, and stereo waveforms without
+  changing the legacy audio rails. `FFTAttack` and `FFTDecay` control the FFT
+  envelope, and live capture supplies its actual sample rate.
+- **Optional feedback ordering:** `.milk` presets can set
+  `bOjoBeatDropFeedback=1` to use BeatDrop-style feedback provenance. Existing
+  presets keep the original ordering; this is not a claim of pixel-identical
+  BeatDrop output.
+- **Microphone recovery:** capture is retried after a device or stream failure,
+  with a 2–30 second backoff and a sustained-live check before resetting retries.
+  Synthetic reactivity remains available while capture is unavailable.
+- **Input and rendering safety:** stronger handling of non-finite audio and
+  preset values, including overflow during numeric conversion and blur-uniform
+  calculations. Finite authored values are preserved rather than broadly clamped.
+
+For developers using `particle-milkdrop`, the renderer also exposes
+**shared-feedback transitions**: supported preset pairs blend evaluated warp
+coordinates and continuous composition controls while both equation states
+advance. Capability checks reject unsupported combinations, including custom
+warp/comp shaders and more complex overlays, so a host can choose another
+transition. Retained composite output and explicit timing/random inputs support
+host-controlled rendering and compositing.
+
+### Current boundaries
+
+The drag-and-drop app still replaces a preset when it is loaded; it does not
+automatically schedule the new transition API. Background preset preparation,
+persistent shader caching, and playlist look-ahead are not included in this
+standalone app update. Enhanced shader-audio helpers cannot currently share a
+preset with named-texture samplers under the fixed sampler layout; that
+combination is rejected instead of rendering with incorrect bindings.
+
+No new FPS or fidelity percentage is claimed for this update. The extended
+waveform attribution and BSD-3-Clause terms are included in
+[`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).
+
 ## Update — August 6, 2026 (8/6/26)
 
 OjoDrop just received a substantial round of MilkDrop compatibility, bug-fix,

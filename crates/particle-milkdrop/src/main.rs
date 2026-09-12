@@ -20,7 +20,8 @@ use winit::{
 // The engine lives in the library crate (single source of truth). This bin is a
 // thin CLI/window shell over it.
 use particle_milkdrop::{
-    fallback_preset, load_preset_path, MilkShaders, MilkdropRenderer, MilkdropResizeDebouncer,
+    enhanced_audio::LEGACY_ASSUMED_SAMPLE_RATE_HZ, fallback_preset, load_preset_path, MilkShaders,
+    MilkdropRenderer, MilkdropResizeDebouncer,
 };
 
 /// Thin path-based wrapper over the library ingest ([`load_preset_path`]) used by
@@ -61,6 +62,10 @@ fn map_audio(f: &particle_audio::Features) -> AudioFrame {
         vol_att: f.vol_react_att,
     }
 }
+
+
+// Share the audio crate's retry policy instead of maintaining a second copy.
+use particle_audio::{CaptureDecision, ReconnectState};
 
 // ---------------------------------------------------------------------------
 // Headless (offscreen) mode — no display required
@@ -497,10 +502,13 @@ struct GpuState {
     /// Coalesces window drag events before calling the renderer's in-place
     /// resize path, so feedback/EEL state survives and target work stays bounded.
     resize_debouncer: MilkdropResizeDebouncer,
-    /// Live mic capture + DSP. None if no input device was available; the
-    /// renderer then falls back to its synthetic audio. Must stay alive for
-    /// capture to continue (cpal stops on drop).
     audio: Option<AudioEngine>,
+    /// Reconnect bookkeeping. Reset to 0 only when a live engine is *observed*
+    /// running — never on a merely successful construction.
+    audio_reconnect: ReconnectState,
+    /// Epoch the reconnect state machine's monotonic durations are measured
+    /// from. Fixed at construction; the state itself owns the attempt clock.
+    audio_epoch: Instant,
 }
 
 impl GpuState {
@@ -582,7 +590,8 @@ impl GpuState {
             }
             None => fallback_preset(),
         };
-        let (renderer, _compiled) = Self::build_renderer(&device, &queue, w, h, format, &shaders);
+        let (mut renderer, _compiled) =
+            Self::build_renderer(&device, &queue, w, h, format, &shaders);
 
         // Start live mic capture (prefer the room mic, not system loopback).
         let audio = match AudioEngine::with_config(
@@ -600,10 +609,16 @@ impl GpuState {
                 Some(eng)
             }
             Err(e) => {
-                log::warn!("audio: {e} — falling back to synthetic reactivity");
+                log::warn!("audio: {e} — retrying with backoff, synthetic reactivity meanwhile");
                 None
             }
         };
+        renderer.set_enhanced_audio_sample_rate(
+            audio
+                .as_ref()
+                .map(|engine| engine.sample_rate() as f32)
+                .unwrap_or(LEGACY_ASSUMED_SAMPLE_RATE_HZ),
+        );
 
         Self {
             surface,
@@ -613,7 +628,59 @@ impl GpuState {
             renderer,
             active_shaders: shaders,
             resize_debouncer: MilkdropResizeDebouncer::default(),
+            // A failed construction counts as attempt #1, so the frame loop waits
+            // the base delay rather than re-enumerating devices on the very next
+            // frame. A successful one starts the counter clean.
+            audio_reconnect: ReconnectState::with_failures(u32::from(audio.is_none())),
+            audio_epoch: Instant::now(),
             audio,
+        }
+    }
+
+    /// Retry lost capture with bounded backoff, using the caller's clock.
+    fn ensure_audio_capture_running(&mut self, now: Instant) {
+        let live = self.audio.as_ref().is_some_and(AudioEngine::is_running);
+        // Dropped before the backoff gate rather than after it — the engine owns
+        // the cpal stream and joins its DSP worker on drop, so it must not hold
+        // the device across the wait for the very reconnect we are waiting on.
+        // (Ordering preserved from the original implementation, not changed here.)
+        if !live && self.audio.take().is_some() {
+            log::warn!("audio: capture stopped; attempting to reconnect");
+        }
+
+        let elapsed = now.saturating_duration_since(self.audio_epoch);
+        // OjoDrop asks for the plain default input, so the crate's device-fallback
+        // rule has no alternate to offer and hands this straight back — the
+        // `cfg` binding is still taken from the decision rather than rebuilt, so
+        // a later change to OjoDrop's request automatically gets the fallback.
+        let requested = CaptureConfig {
+            prefer_loopback: false,
+        };
+        let CaptureDecision::Reconnect(cfg) = self.audio_reconnect.poll(live, elapsed, requested)
+        else {
+            return;
+        };
+
+        match AudioEngine::with_config(cfg, 1.0) {
+            Ok(eng) => {
+                log::info!(
+                    "audio: reconnected to '{}' @ {} Hz",
+                    eng.device_name(),
+                    eng.sample_rate()
+                );
+                self.renderer
+                    .set_enhanced_audio_sample_rate(eng.sample_rate() as f32);
+                // Deliberately NOT resetting the failure count here — see
+                // [`ReconnectState::poll`]. Capture must remain live for the
+                // settle window before it clears; a device that opens and
+                // immediately dies must keep escalating.
+                self.audio = Some(eng);
+            }
+            Err(e) => {
+                self.audio_reconnect.note_open_error(e.to_string());
+                let next = self.audio_reconnect.delay();
+                log::warn!("audio: reconnect failed ({e}); next attempt in {next:?}");
+            }
         }
     }
 
@@ -671,13 +738,19 @@ impl GpuState {
                     log::warn!("no comp shader found in {name}");
                 }
                 let (w, h) = (self.config.width, self.config.height);
-                let (renderer, compiled) = Self::build_renderer(
+                let (mut renderer, compiled) = Self::build_renderer(
                     &self.device,
                     &self.queue,
                     w,
                     h,
                     self.config.format,
                     &shaders,
+                );
+                renderer.set_enhanced_audio_sample_rate(
+                    self.audio
+                        .as_ref()
+                        .map(|engine| engine.sample_rate() as f32)
+                        .unwrap_or(LEGACY_ASSUMED_SAMPLE_RATE_HZ),
                 );
                 self.renderer = renderer;
                 self.active_shaders = shaders;
@@ -707,13 +780,18 @@ impl GpuState {
     }
 
     fn render(&mut self) {
-        if let Some((width, height)) = self.resize_debouncer.take_ready(Instant::now()) {
+        let now = Instant::now();
+        if let Some((width, height)) = self.resize_debouncer.take_ready(now) {
             if let Err(error) = self.renderer.try_resize(width, height) {
                 log::warn!(
                     "MilkDrop resize to {width}x{height} rejected; retaining live targets: {error}"
                 );
             }
         }
+        // Before the surface acquire, not after: the `Outdated`/`Lost` arm below
+        // returns early, and audio recovery must not be starved by a window
+        // that is busy being resized or reconfigured.
+        self.ensure_audio_capture_running(now);
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
@@ -942,4 +1020,249 @@ fn main() {
         state: None,
     };
     event_loop.run_app(&mut app).expect("run");
+}
+
+#[cfg(test)]
+mod reconnect_policy_tests {
+    use super::*;
+    use std::time::Duration;
+
+    use particle_audio::reconnect::{
+        audio_reconnect_delay, should_try_audio_reconnect, AUDIO_RECONNECT_BASE_DELAY,
+        AUDIO_RECONNECT_MAX_DELAY, AUDIO_RECONNECT_SETTLE,
+    };
+
+    /// OjoDrop asks for the plain default input, so the crate's device-fallback
+    /// rule has no alternate and every decision must come back with this config.
+    const OJODROP_CFG: CaptureConfig = CaptureConfig {
+        prefer_loopback: false,
+    };
+
+    /// The 2-argument `poll` these tests were written against is now 3-argument.
+    /// This shim keeps the replay bodies unchanged AND asserts the extra fact the
+    /// new signature buys: OjoDrop's request survives the fallback rule intact.
+    fn poll(state: &mut ReconnectState, live: bool, now: Duration) -> CaptureDecision {
+        let decision = state.poll(live, now, OJODROP_CFG);
+        if let CaptureDecision::Reconnect(cfg) = decision {
+            assert_eq!(
+                cfg, OJODROP_CFG,
+                "OjoDrop never asks for loopback, so no fallback may be substituted"
+            );
+        }
+        decision
+    }
+
+    #[test]
+    fn first_attempt_after_a_loss_is_immediate() {
+        // A freshly noticed loss must not wait: attempt 0 fires on the same frame.
+        assert!(should_try_audio_reconnect(0, Duration::ZERO));
+    }
+
+    #[test]
+    fn second_attempt_waits_the_base_delay() {
+        assert!(!should_try_audio_reconnect(1, Duration::from_millis(1_999)));
+        assert!(should_try_audio_reconnect(1, Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn delay_doubles_per_consecutive_failure() {
+        assert_eq!(audio_reconnect_delay(0), Duration::ZERO);
+        assert_eq!(audio_reconnect_delay(1), Duration::from_secs(2));
+        assert_eq!(audio_reconnect_delay(2), Duration::from_secs(4));
+        assert_eq!(audio_reconnect_delay(3), Duration::from_secs(8));
+        assert_eq!(audio_reconnect_delay(4), Duration::from_secs(16));
+    }
+
+    #[test]
+    fn delay_is_capped_and_never_overflows() {
+        // 2 s << 4 would be 32 s, past the cap; everything above must clamp,
+        // and a pathological attempt count must not panic or wrap.
+        assert_eq!(audio_reconnect_delay(5), AUDIO_RECONNECT_MAX_DELAY);
+        assert_eq!(audio_reconnect_delay(64), AUDIO_RECONNECT_MAX_DELAY);
+        assert_eq!(audio_reconnect_delay(u32::MAX), AUDIO_RECONNECT_MAX_DELAY);
+    }
+
+    #[test]
+    fn the_delay_boundary_is_inclusive() {
+        // `should_try` must agree with `audio_reconnect_delay` exactly at the
+        // boundary, or a frame landing precisely on it stalls a whole period.
+        for attempts in [0u32, 1, 2, 3, 4, 5, 99] {
+            let delay = audio_reconnect_delay(attempts);
+            assert!(
+                should_try_audio_reconnect(attempts, delay),
+                "attempt {attempts} should fire at exactly its own delay {delay:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_capped_wait_still_eventually_fires() {
+        assert!(!should_try_audio_reconnect(9, Duration::from_secs(29)));
+        assert!(should_try_audio_reconnect(9, Duration::from_secs(30)));
+    }
+
+    /// Replay `frames` frames on a synthetic monotonic clock, driving the state
+    /// machine exactly as `ensure_audio_capture_running` does. `live_at` decides
+    /// whether capture is *observed* live on each frame. Returns how many
+    /// reconnect attempts the policy authorised.
+    fn replay(
+        state: &mut ReconnectState,
+        frames: u32,
+        frame_dt: Duration,
+        live_at: impl Fn(u32) -> bool,
+    ) -> u32 {
+        let mut attempts = 0;
+        for frame in 0..frames {
+            let now = frame_dt * (frame + 1);
+            if poll(state, live_at(frame), now) == CaptureDecision::Reconnect(OJODROP_CFG) {
+                attempts += 1;
+            }
+        }
+        attempts
+    }
+
+    #[test]
+    fn a_flapping_device_escalates_instead_of_reopening_every_frame() {
+        // The device opens cleanly every time and its worker dies before the
+        // next frame, so `live` is false on every poll while every attempt
+        // "succeeds". Counting construction success as recovery pinned the
+        // count at 0, which pinned the delay at ZERO, which reopened the cpal
+        // stream ~60x/second for the rest of the set.
+        let mut state = ReconnectState::default();
+        let attempts = replay(&mut state, 600, Duration::from_millis(16), |_| false);
+        assert!(
+            attempts <= 5,
+            "flapping device authorised {attempts} reopens in ~9.6 s of frames"
+        );
+        assert!(
+            state.delay() >= AUDIO_RECONNECT_BASE_DELAY,
+            "a flapping device must escalate past the base delay, got {:?}",
+            state.delay()
+        );
+    }
+
+    #[test]
+    fn a_one_frame_liveness_blip_does_not_reset_the_ladder() {
+        // The race in `AudioEngine`: `running` is initialised true at
+        // construction (particle-audio/src/lib.rs:428) and only cleared later
+        // from the cpal error callback (capture.rs:627). A device erroring
+        // within ~5-20 ms therefore reports live for exactly one ~16.7 ms
+        // frame between deaths. A reset keyed on a single live poll treats that
+        // blip as recovery and puts the ladder back at zero every other frame,
+        // which is the pre-fix reopen rate all over again.
+        let mut state = ReconnectState::default();
+        let attempts = replay(&mut state, 600, Duration::from_millis(16), |frame| {
+            frame % 2 == 1
+        });
+        assert!(
+            attempts <= 5,
+            "one-frame liveness blip authorised {attempts} reopens in ~9.6 s of frames"
+        );
+        assert!(
+            state.delay() >= AUDIO_RECONNECT_BASE_DELAY,
+            "a blipping device must escalate past the base delay, got {:?}",
+            state.delay()
+        );
+    }
+
+    #[test]
+    fn only_sustained_liveness_resets_the_counter() {
+        let mut state = ReconnectState::default();
+        // Three attempts, none of them ever followed by sustained liveness.
+        assert_eq!(
+            poll(&mut state, false, Duration::ZERO),
+            CaptureDecision::Reconnect(OJODROP_CFG)
+        );
+        assert_eq!(state.delay(), Duration::from_secs(2));
+        assert_eq!(
+            poll(&mut state, false, Duration::from_secs(2)),
+            CaptureDecision::Reconnect(OJODROP_CFG)
+        );
+        assert_eq!(state.delay(), Duration::from_secs(4));
+        assert_eq!(
+            poll(&mut state, false, Duration::from_secs(6)),
+            CaptureDecision::Reconnect(OJODROP_CFG)
+        );
+        assert_eq!(state.delay(), Duration::from_secs(8));
+        // A live frame alone is NOT recovery — the ladder must hold.
+        assert_eq!(
+            poll(&mut state, true, Duration::from_millis(6_016)),
+            CaptureDecision::Idle
+        );
+        assert_eq!(
+            state.delay(),
+            Duration::from_secs(8),
+            "a single live frame must not clear the ladder"
+        );
+        // Liveness held for the settle window is. The run began at 6.016 s, so
+        // the window closes at 6.016 s + SETTLE — not 6 s + SETTLE.
+        assert_eq!(
+            poll(
+                &mut state,
+                true,
+                Duration::from_millis(6_016) + AUDIO_RECONNECT_SETTLE
+            ),
+            CaptureDecision::Idle
+        );
+        assert_eq!(state.delay(), Duration::ZERO);
+    }
+
+    #[test]
+    fn frames_inside_the_backoff_window_are_waits_not_attempts() {
+        let mut state = ReconnectState::default();
+        assert_eq!(
+            poll(&mut state, false, Duration::ZERO),
+            CaptureDecision::Reconnect(OJODROP_CFG)
+        );
+        for ms in [16u64, 500, 1_000, 1_999] {
+            assert_eq!(
+                poll(&mut state, false, Duration::from_millis(ms)),
+                CaptureDecision::Wait,
+                "{ms} ms into a 2 s backoff must be a wait"
+            );
+        }
+        assert_eq!(
+            state.delay(),
+            AUDIO_RECONNECT_BASE_DELAY,
+            "waiting must not escalate the delay"
+        );
+    }
+
+    #[test]
+    fn a_genuine_recovery_still_returns_to_zero_backoff() {
+        // The legitimate case the hardening must not regress: capture dies, one
+        // reconnect is attempted, and the rebuilt engine then stays up. Once it
+        // has held for the settle window the ladder clears, and a later,
+        // unrelated loss is treated as fresh (immediate retry).
+        let mut state = ReconnectState::default();
+        assert_eq!(
+            poll(&mut state, false, Duration::ZERO),
+            CaptureDecision::Reconnect(OJODROP_CFG)
+        );
+        // Continuously-live 60 Hz frames, derived from AUDIO_RECONNECT_SETTLE
+        // rather than hardcoded, so raising the base delay (which the settle
+        // window is defined as) cannot silently leave this guard holding for
+        // less than the window it is meant to clear. `replay` polls frame `i`
+        // at `FRAME * (i + 1)`, so the settle clock starts one frame in:
+        // ceil(SETTLE / FRAME) + 1 is the minimum, plus a little margin.
+        const FRAME: Duration = Duration::from_millis(16);
+        const MARGIN_FRAMES: u32 = 4;
+        let settle_frames = AUDIO_RECONNECT_SETTLE
+            .as_millis()
+            .div_ceil(FRAME.as_millis()) as u32
+            + 1
+            + MARGIN_FRAMES;
+        let held = replay(&mut state, settle_frames, FRAME, |_| true);
+        assert_eq!(held, 0, "a live device must never authorise a reconnect");
+        assert_eq!(
+            state.delay(),
+            Duration::ZERO,
+            "sustained liveness must clear the ladder"
+        );
+        assert_eq!(
+            poll(&mut state, false, Duration::from_secs(600)),
+            CaptureDecision::Reconnect(OJODROP_CFG),
+            "a later, unrelated loss must retry immediately again"
+        );
+    }
 }
